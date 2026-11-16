@@ -1,10 +1,14 @@
 package com.example
 
+import android.app.Application
 import android.graphics.Bitmap
+import androidx.test.core.app.ApplicationProvider
 import com.example.cad.engine.ActiveTool
+import com.example.cad.engine.CadWorkspaceViewModel
 import com.example.cad.engine.CommandProcessor
 import com.example.cad.engine.DrawTool
 import com.example.cad.engine.ParsedCliInput
+import com.example.cad.engine.UndoRedoManager
 import com.example.cad.geometry.CadSpatialIndex
 import com.example.cad.geometry.GeometryEngine
 import com.example.cad.geometry.GeometryOperations
@@ -31,7 +35,9 @@ import com.example.cad.model.OsnapType
 import com.example.cad.model.SnapSettings
 import com.example.cad.model.Vec2
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -350,6 +356,128 @@ class CadEngineTest {
         val jpgOut = ByteArrayOutputStream()
         CadExportEngine.exportToRaster(doc, jpgOut, Bitmap.CompressFormat.JPEG, 400, 300)
         assertTrue(jpgOut.size() > 100)
+    }
+
+    @Test
+    fun `undo redo manager supports multi step revert reapply branch clearing and depth cap`() {
+        val manager = UndoRedoManager(defaultMaxDepth = 3)
+        val doc0 = CadDocument(name = "Doc0")
+        val doc1 = doc0.copy(entities = listOf(CadLine(start = Vec2(0.0, 0.0), end = Vec2(10.0, 0.0))))
+        val doc2 = doc0.copy(entities = doc1.entities + CadCircle(center = Vec2(5.0, 5.0), radius = 3.0))
+        val doc3 = doc0.copy(entities = doc2.entities + CadLine(start = Vec2(0.0, 10.0), end = Vec2(10.0, 10.0)))
+        val doc4 = doc0.copy(entities = doc3.entities + CadLine(start = Vec2(10.0, 0.0), end = Vec2(10.0, 10.0)))
+
+        manager.record(doc0, "Draw Line 1")
+        manager.record(doc1, "Draw Circle")
+        manager.record(doc2, "Draw Line 2")
+        manager.record(doc3, "Draw Line 3") // exceeds depth=3, drops oldest (doc0)
+
+        assertTrue(manager.canUndo)
+        assertFalse(manager.canRedo)
+        assertEquals(3, manager.undoCount)
+        assertEquals(listOf("Draw Line 3", "Draw Line 2", "Draw Circle"), manager.undoHistoryLabels())
+        assertEquals("Draw Line 3", manager.nextUndoLabel)
+
+        // Multi-step undo (2 steps: doc4 -> doc2)
+        val reverted = manager.undoSteps(doc4, 2)
+        assertNotNull(reverted)
+        assertEquals(2, reverted!!.document.entities.size)
+        assertEquals("Draw Line 2", reverted.actionLabel)
+        assertEquals(1, manager.undoCount)
+        assertEquals(2, manager.redoCount)
+        assertEquals(listOf("Draw Line 2", "Draw Line 3"), manager.redoHistoryLabels())
+
+        // Redo 1 step (doc2 -> doc3)
+        val reapplied = manager.redo(reverted.document)
+        assertNotNull(reapplied)
+        assertEquals(3, reapplied!!.document.entities.size)
+        assertEquals(2, manager.undoCount)
+        assertEquals(1, manager.redoCount)
+
+        // Recording a new edit while redo stack has items clears the redo branch
+        val branchedDoc = reapplied.document.copy(entities = reapplied.document.entities + CadPoint(position = Vec2(1.0, 1.0)))
+        manager.record(reapplied.document, "Draw Point")
+        assertFalse(manager.canRedo)
+        assertEquals(0, manager.redoCount)
+        assertNull(manager.redo(reapplied.document))
+        assertEquals(4, branchedDoc.entities.size)
+    }
+
+    @Test
+    fun `command processor parses undo and redo shortcuts with optional step counts`() {
+        assertEquals(ParsedCliInput.UndoCommand(1), CommandProcessor.parse("u", null))
+        assertEquals(ParsedCliInput.UndoCommand(1), CommandProcessor.parse("UNDO", null))
+        assertEquals(ParsedCliInput.UndoCommand(3), CommandProcessor.parse("undo 3", null))
+        assertEquals(ParsedCliInput.UndoCommand(2), CommandProcessor.parse("U 2", null))
+        assertEquals(ParsedCliInput.RedoCommand(1), CommandProcessor.parse("REDO", null))
+        assertEquals(ParsedCliInput.RedoCommand(4), CommandProcessor.parse("redo 4", null))
+    }
+
+    @Test
+    fun `dxf parser loads files with utf8 bom leading blank lines and non finite coordinates`() {
+        val messyDxf = "\uFEFF\n\n  \n0\nSECTION\n\n2\nENTITIES\n0\nLINE\n8\n0\n10\nNaN\n20\n5.0\n11\n25.0\n21\n15.0\n0\nENDSEC\n0\nEOF\n"
+        val parsed = DxfParser.parse(ByteArrayInputStream(messyDxf.toByteArray()), "MessyDxf")
+        assertEquals(1, parsed.entities.size)
+        val line = parsed.entities.first() as CadLine
+        assertEquals(0.0, line.start.x, 1e-6)
+        assertEquals(5.0, line.start.y, 1e-6)
+        assertEquals(25.0, line.end.x, 1e-6)
+    }
+
+    @Test
+    fun `workspace viewmodel integrates undo redo for drafting cli layouts and vertex rollback`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val vm = CadWorkspaceViewModel(app)
+        vm.loadNewDocumentWithParams("UndoTest", "QA", CadUnits.MILLIMETERS)
+
+        assertFalse(vm.uiState.value.canUndo)
+        assertEquals(0, vm.uiState.value.document.entities.size)
+
+        // Draw a LINE via CLI
+        vm.submitCommandInput("L")
+        vm.submitCommandInput("0,0")
+        vm.submitCommandInput("100,0")
+        assertEquals(1, vm.uiState.value.document.entities.size)
+        assertTrue(vm.uiState.value.canUndo)
+        assertEquals(1, vm.uiState.value.undoCount)
+        assertEquals("LINE", vm.uiState.value.undoDescription)
+
+        // Undo via CLI "U"
+        vm.submitCommandInput("U")
+        assertEquals(0, vm.uiState.value.document.entities.size)
+        assertFalse(vm.uiState.value.canUndo)
+        assertTrue(vm.uiState.value.canRedo)
+        assertEquals("LINE", vm.uiState.value.redoDescription)
+
+        // Redo via CLI "REDO"
+        vm.submitCommandInput("REDO")
+        assertEquals(1, vm.uiState.value.document.entities.size)
+        assertTrue(vm.uiState.value.canUndo)
+        assertFalse(vm.uiState.value.canRedo)
+
+        // Buffered PLINE vertex undo removes last picked vertex before committing
+        vm.submitCommandInput("PL")
+        vm.submitCommandInput("0,0")
+        vm.submitCommandInput("10,0")
+        vm.submitCommandInput("10,10")
+        assertEquals(3, vm.uiState.value.session.collectedPoints.size)
+        vm.undo()
+        assertEquals(2, vm.uiState.value.session.collectedPoints.size)
+        vm.finishActiveTool()
+        assertEquals(2, vm.uiState.value.document.entities.size)
+
+        // Layout operations are also undoable
+        val initialLayoutCount = vm.uiState.value.document.layouts.size
+        vm.addLayout()
+        assertEquals(initialLayoutCount + 1, vm.uiState.value.document.layouts.size)
+        vm.undo()
+        assertEquals(initialLayoutCount, vm.uiState.value.document.layouts.size)
+
+        // Duplicate loadDrawing with same ID does not discard active edits/undo state
+        val activeId = vm.uiState.value.document.id
+        vm.loadDrawing(activeId, recoverAutosave = false)
+        assertEquals(2, vm.uiState.value.document.entities.size)
+        assertTrue(vm.uiState.value.canUndo)
     }
 
     // ==================== Synthetic Binary DWG Builders for Unit Tests ====================

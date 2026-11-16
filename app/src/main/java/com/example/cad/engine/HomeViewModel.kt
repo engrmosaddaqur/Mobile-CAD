@@ -41,14 +41,14 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         viewModelScope.launch {
-            fileRepo.seedInitialSamplesIfEmpty()
-            _pendingRecovery.value = fileRepo.getPendingRecovery()
+            runCatching { fileRepo.seedInitialSamplesIfEmpty() }
+            _pendingRecovery.value = runCatching { fileRepo.getPendingRecovery() }.getOrNull()
         }
     }
 
     fun refreshRecoveryStatus() {
         viewModelScope.launch {
-            _pendingRecovery.value = fileRepo.getPendingRecovery()
+            _pendingRecovery.value = runCatching { fileRepo.getPendingRecovery() }.getOrNull()
         }
     }
 

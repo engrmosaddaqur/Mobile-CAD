@@ -10,6 +10,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavType
@@ -44,6 +47,7 @@ class MainActivity : ComponentActivity() {
 
             val navController = rememberNavController()
             val prefsRepo = UserPreferencesRepository(applicationContext)
+            var handledIncomingUriStr by rememberSaveable { mutableStateOf<String?>(null) }
 
             val openFileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                 uri?.let {
@@ -54,8 +58,10 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(incomingUri) {
-                incomingUri?.let { uri ->
-                    homeViewModel.importFile(uri) { importedId ->
+                val uriStr = incomingUri?.toString()
+                if (incomingUri != null && uriStr != handledIncomingUriStr) {
+                    handledIncomingUriStr = uriStr
+                    homeViewModel.importFile(incomingUri) { importedId ->
                         navController.navigate("workspace/$importedId?recover=false")
                     }
                 }

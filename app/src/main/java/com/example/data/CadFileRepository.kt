@@ -16,7 +16,10 @@ import com.example.cad.model.CadDocument
 import com.example.cad.model.CadSourceFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -61,10 +64,12 @@ class CadFileRepository(
     val recentDrawings: Flow<List<RecentDrawingEntity>> = dao.observeAll()
 
     suspend fun seedInitialSamplesIfEmpty() = withContext(Dispatchers.IO) {
-        val existing = drawingsDir.listFiles()
-        if (existing != null && existing.isNotEmpty()) return@withContext
-        for (sample in SampleDrawings.allSampleTemplates()) {
-            saveDrawingInternal(sample, clearRecovery = true)
+        seedMutex.withLock {
+            val existing = drawingsDir.listFiles()
+            if (existing != null && existing.isNotEmpty()) return@withLock
+            for (sample in SampleDrawings.allSampleTemplates()) {
+                saveDrawingInternal(sample, clearRecovery = true)
+            }
         }
     }
 
@@ -85,10 +90,13 @@ class CadFileRepository(
         if (!targetFile.exists()) return@withContext null
         FileInputStream(targetFile).use { fis ->
             val parsed = DxfParser.parse(fis, entry.name)
+            val resolvedFormat = CadSourceFormat.entries.firstOrNull {
+                it.name.equals(entry.format, ignoreCase = true) || it.label.equals(entry.format, ignoreCase = true)
+            } ?: CadSourceFormat.DXF
             val result = parsed.copy(
                 id = entry.id,
                 projectGroup = entry.projectGroup,
-                sourceFormat = runCatching { CadSourceFormat.valueOf(entry.format) }.getOrDefault(CadSourceFormat.DXF),
+                sourceFormat = resolvedFormat,
                 lastModifiedMs = entry.lastModifiedMs,
                 isDirty = preferRecovery && entry.hasUnsavedRecovery
             )
@@ -211,37 +219,49 @@ class CadFileRepository(
             val stream = context.contentResolver.openInputStream(uri)
                 ?: return@withContext CadImportOutcome.Error("Import Failed", "Could not open file stream.")
 
-            val bytes = stream.use { it.readBytes() }
-            if (bytes.isEmpty()) {
-                return@withContext CadImportOutcome.Error("Import Failed", "Selected CAD file is empty.")
-            }
-
-            // Sniff magic header bytes so Android content URIs without a .dwg extension still route to DwgEngine
-            val hasDwgSignature = bytes.size >= 6 &&
-                bytes[0] == 'A'.code.toByte() &&
-                bytes[1] == 'C'.code.toByte() &&
-                bytes[2] == '1'.code.toByte() &&
-                bytes[3] == '0'.code.toByte()
-
-            val isDwgFile = (ext == "dwg" || hasDwgSignature) && !DwgEngine.isAsciiDxfPayload(bytes)
-
-            if (isDwgFile || ext == "dwg") {
-                when (val res = DwgEngine.readDwg(ByteArrayInputStream(bytes), baseName, uri.toString())) {
-                    is DwgOperationResult.Success -> {
-                        val saved = saveDrawingInternal(res.document, clearRecovery = true)
-                        CadImportOutcome.Success(saved)
-                    }
-                    is DwgOperationResult.UnsupportedBinaryDwg -> {
-                        CadImportOutcome.Error(
-                            title = "DWG Compatibility (${res.detectedVersion})",
-                            message = res.diagnosticMessage
-                        )
-                    }
+            BufferedInputStream(stream, 65536).use { bis ->
+                bis.mark(512)
+                val headerBuf = ByteArray(512)
+                var headerRead = 0
+                while (headerRead < headerBuf.size) {
+                    val n = bis.read(headerBuf, headerRead, headerBuf.size - headerRead)
+                    if (n <= 0) break
+                    headerRead += n
                 }
-            } else {
-                val parsed = DxfParser.parse(ByteArrayInputStream(bytes), baseName, uri.toString())
-                val saved = saveDrawingInternal(parsed, clearRecovery = true)
-                CadImportOutcome.Success(saved)
+                if (headerRead == 0) {
+                    return@withContext CadImportOutcome.Error("Import Failed", "Selected CAD file is empty.")
+                }
+                bis.reset()
+
+                val headerSample = if (headerRead == headerBuf.size) headerBuf else headerBuf.copyOf(headerRead)
+                val hasDwgSignature = headerSample.size >= 6 &&
+                    headerSample[0] == 'A'.code.toByte() &&
+                    headerSample[1] == 'C'.code.toByte() &&
+                    headerSample[2] == '1'.code.toByte() &&
+                    headerSample[3] == '0'.code.toByte()
+
+                val isAsciiDxf = DwgEngine.isAsciiDxfPayload(headerSample)
+                val isDwgFile = (ext == "dwg" || hasDwgSignature) && !isAsciiDxf
+
+                if (isDwgFile) {
+                    val bytes = bis.readBytes()
+                    when (val res = DwgEngine.readDwg(ByteArrayInputStream(bytes), baseName, uri.toString())) {
+                        is DwgOperationResult.Success -> {
+                            val saved = saveDrawingInternal(res.document, clearRecovery = true)
+                            CadImportOutcome.Success(saved)
+                        }
+                        is DwgOperationResult.UnsupportedBinaryDwg -> {
+                            CadImportOutcome.Error(
+                                title = "DWG Compatibility (${res.detectedVersion})",
+                                message = res.diagnosticMessage
+                            )
+                        }
+                    }
+                } else {
+                    val parsed = DxfParser.parse(bis, baseName, uri.toString())
+                    val saved = saveDrawingInternal(parsed, clearRecovery = true)
+                    CadImportOutcome.Success(saved)
+                }
             }
         } catch (e: Exception) {
             CadImportOutcome.Error("CAD Parse Error", e.message ?: "Malformed CAD file.")
@@ -279,6 +299,10 @@ class CadFileRepository(
             }
         }
         return uri.lastPathSegment
+    }
+
+    companion object {
+        private val seedMutex = Mutex()
     }
 }
 

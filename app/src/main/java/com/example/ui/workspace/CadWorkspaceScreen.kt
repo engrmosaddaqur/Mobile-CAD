@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Layers
@@ -55,6 +57,7 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -63,6 +66,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -84,6 +88,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -118,6 +123,7 @@ fun CadWorkspaceScreen(
     var showOsnapDialog by remember { mutableStateOf(false) }
     var showUnitsDialog by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
+    var showHistoryDialog by remember { mutableStateOf(false) }
     var pendingExportFormat by remember { mutableStateOf<ExportFormat?>(null) }
     var commandText by remember { mutableStateOf("") }
 
@@ -155,12 +161,13 @@ fun CadWorkspaceScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background
     ) { _ ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .navigationBarsPadding()
-        ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+            ) {
             // 1. TOP BAR: Back | Drawing Name | Save | Undo | Redo | More Options
             Surface(
                 color = MaterialTheme.colorScheme.surface,
@@ -212,18 +219,26 @@ fun CadWorkspaceScreen(
                         )
                     }
                     IconButton(
-                        onClick = viewModel::undo,
+                        onClick = { viewModel.undo() },
                         enabled = state.canUndo,
                         modifier = Modifier.testTag("workspace_undo_btn")
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = stringResource(R.string.cd_undo))
+                        Icon(
+                            Icons.AutoMirrored.Filled.Undo,
+                            contentDescription = state.undoDescription?.let { "Undo $it" }
+                                ?: stringResource(R.string.cd_undo)
+                        )
                     }
                     IconButton(
-                        onClick = viewModel::redo,
+                        onClick = { viewModel.redo() },
                         enabled = state.canRedo,
                         modifier = Modifier.testTag("workspace_redo_btn")
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = stringResource(R.string.cd_redo))
+                        Icon(
+                            Icons.AutoMirrored.Filled.Redo,
+                            contentDescription = state.redoDescription?.let { "Redo $it" }
+                                ?: stringResource(R.string.cd_redo)
+                        )
                     }
                     Box {
                         IconButton(
@@ -258,6 +273,11 @@ fun CadWorkspaceScreen(
                                 text = { Text("Deselect All") },
                                 leadingIcon = { Icon(Icons.Default.Close, null) },
                                 onClick = { showMoreMenu = false; viewModel.deselectAll() }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Undo / Redo History (${state.undoCount} / ${state.redoCount})...") },
+                                leadingIcon = { Icon(Icons.Default.History, null) },
+                                onClick = { showMoreMenu = false; showHistoryDialog = true }
                             )
                             DropdownMenuItem(
                                 text = { Text("Drawing Units (${state.document.units.shortLabel})") },
@@ -434,6 +454,48 @@ fun CadWorkspaceScreen(
                 }
             }
         }
+
+            AnimatedVisibility(visible = state.isBusy) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.48f))
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) {}
+                        .testTag("workspace_loading_overlay"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        tonalElevation = 6.dp,
+                        color = MaterialTheme.colorScheme.surface,
+                        modifier = Modifier
+                            .padding(24.dp)
+                            .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(color = CadCyan)
+                            Text(
+                                text = state.loadingMessage,
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = "Preparing CAD geometry and spatial index...",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Dialogs
@@ -514,6 +576,21 @@ fun CadWorkspaceScreen(
         )
     }
 
+    if (showHistoryDialog) {
+        UndoRedoHistoryDialog(
+            state = state,
+            onUndoSteps = { steps ->
+                viewModel.undo(steps)
+                showHistoryDialog = false
+            },
+            onRedoSteps = { steps ->
+                viewModel.redo(steps)
+                showHistoryDialog = false
+            },
+            onDismiss = { showHistoryDialog = false }
+        )
+    }
+
     state.errorDialogPair?.let { (title, message) ->
         AlertDialog(
             onDismissRequest = viewModel::dismissErrorDialog,
@@ -522,6 +599,116 @@ fun CadWorkspaceScreen(
             confirmButton = { Button(onClick = viewModel::dismissErrorDialog) { Text("OK") } }
         )
     }
+}
+
+@Composable
+private fun UndoRedoHistoryDialog(
+    state: CadWorkspaceUiState,
+    onUndoSteps: (Int) -> Unit,
+    onRedoSteps: (Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Undo / Redo History") },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { onUndoSteps(1) },
+                        enabled = state.canUndo,
+                        modifier = Modifier.weight(1f).testTag("history_undo_one_btn")
+                    ) {
+                        Text("Undo (${state.undoCount})")
+                    }
+                    OutlinedButton(
+                        onClick = { onRedoSteps(1) },
+                        enabled = state.canRedo,
+                        modifier = Modifier.weight(1f).testTag("history_redo_one_btn")
+                    ) {
+                        Text("Redo (${state.redoCount})")
+                    }
+                }
+                if (state.undoHistoryLabels.isEmpty() && state.redoHistoryLabels.isEmpty()) {
+                    Text(
+                        text = "No drafting history recorded yet in this session.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 260.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (state.redoHistoryLabels.isNotEmpty()) {
+                            item {
+                                Text(
+                                    text = "REDO STACK (Tap to reapply)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CadAmber
+                                )
+                            }
+                            items(state.redoHistoryLabels.size) { index ->
+                                val label = state.redoHistoryLabels[index]
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onRedoSteps(index + 1) }
+                                ) {
+                                    Text(
+                                        text = "+${index + 1}  $label",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                                    )
+                                }
+                            }
+                        }
+                        if (state.undoHistoryLabels.isNotEmpty()) {
+                            item {
+                                Text(
+                                    text = "UNDO STACK (Tap to revert)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CadCyan,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                            items(state.undoHistoryLabels.size) { index ->
+                                val label = state.undoHistoryLabels[index]
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onUndoSteps(index + 1) }
+                                ) {
+                                    Text(
+                                        text = "-${index + 1}  $label",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
 }
 
 @Composable

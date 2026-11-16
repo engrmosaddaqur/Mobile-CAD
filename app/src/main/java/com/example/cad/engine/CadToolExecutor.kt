@@ -24,7 +24,8 @@ data class ToolStepOutcome(
     val promptMessage: String,
     val measurement: MeasurementReadout? = null,
     val shouldCommitHistory: Boolean = false,
-    val resetToSelect: Boolean = false
+    val resetToSelect: Boolean = false,
+    val historyLabel: String? = null
 )
 
 object CadToolExecutor {
@@ -213,12 +214,17 @@ object CadToolExecutor {
         val visibleLayers = doc.layers.filter { it.isOn && !it.isFrozen }.map { it.name }.toSet()
         val lockedLayers = doc.layers.filter { it.isLocked }.map { it.name }.toSet()
 
-        return when (activeTool) {
+        val rawOutcome = when (activeTool) {
             is ActiveTool.Draw -> handleDrawTap(activeTool.tool, point, doc, session, config)
             is ActiveTool.Modify -> handleModifyTap(activeTool.tool, point, doc, session, config, visibleLayers, lockedLayers, hitToleranceWorld)
             is ActiveTool.Dimension -> handleDimensionTap(activeTool.type, point, doc, session, visibleLayers, hitToleranceWorld)
             is ActiveTool.Measure -> handleMeasureTap(activeTool.tool, point, doc, session, visibleLayers, hitToleranceWorld)
             else -> ToolStepOutcome(nextSession = session, promptMessage = "Ready")
+        }
+        return if (rawOutcome.shouldCommitHistory && rawOutcome.historyLabel == null) {
+            rawOutcome.copy(historyLabel = activeTool.displayName)
+        } else {
+            rawOutcome
         }
     }
 

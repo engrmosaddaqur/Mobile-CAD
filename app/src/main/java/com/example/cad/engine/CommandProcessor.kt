@@ -18,6 +18,8 @@ sealed class ParsedCliInput {
     data object DeselectAll : ParsedCliInput()
     data object SaveDrawing : ParsedCliInput()
     data object OpenLayers : ParsedCliInput()
+    data class UndoCommand(val steps: Int = 1) : ParsedCliInput()
+    data class RedoCommand(val steps: Int = 1) : ParsedCliInput()
     data object Help : ParsedCliInput()
     data class Unknown(val raw: String) : ParsedCliInput()
 }
@@ -81,6 +83,15 @@ object CommandProcessor {
             }
         }
 
+        if (upper.startsWith("UNDO ") || upper.startsWith("U ")) {
+            val steps = upper.substringAfter(' ').trim().toIntOrNull()?.coerceIn(1, 50) ?: 1
+            return ParsedCliInput.UndoCommand(steps)
+        }
+        if (upper.startsWith("REDO ")) {
+            val steps = upper.substringAfter(' ').trim().toIntOrNull()?.coerceIn(1, 50) ?: 1
+            return ParsedCliInput.RedoCommand(steps)
+        }
+
         // Direct scalar numeric value (length, radius, angle, distance)
         input.toDoubleOrNull()?.let { return ParsedCliInput.ScalarValue(it) }
 
@@ -115,8 +126,8 @@ object CommandProcessor {
             "BR", "BREAK" -> ParsedCliInput.SwitchTool(ActiveTool.Modify(ModifyTool.BREAK), "BREAK: Tap entity at break point")
             "E", "ERASE" -> ParsedCliInput.SwitchTool(ActiveTool.Modify(ModifyTool.ERASE), "ERASE: Erased selected entities")
             "DEL", "DELETE" -> ParsedCliInput.SwitchTool(ActiveTool.Modify(ModifyTool.DELETE), "DELETE: Deleted selected entities")
-            "U", "UNDO" -> ParsedCliInput.SwitchTool(ActiveTool.Modify(ModifyTool.UNDO), "UNDO")
-            "REDO" -> ParsedCliInput.SwitchTool(ActiveTool.Modify(ModifyTool.REDO), "REDO")
+            "U", "UNDO" -> ParsedCliInput.UndoCommand(1)
+            "REDO" -> ParsedCliInput.RedoCommand(1)
 
             "DIMLINEAR", "DLI" -> ParsedCliInput.SwitchTool(ActiveTool.Dimension(DimensionType.LINEAR), "DIMLINEAR: Specify first and second extension origin, then dimension line location")
             "DIMALIGNED", "DAL" -> ParsedCliInput.SwitchTool(ActiveTool.Dimension(DimensionType.ALIGNED), "DIMALIGNED: Specify first and second point, then offset")

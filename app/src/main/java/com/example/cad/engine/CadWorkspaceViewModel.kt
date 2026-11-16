@@ -31,6 +31,7 @@ import com.example.data.CadImportOutcome
 import com.example.data.ExportFormat
 import com.example.data.UserPreferences
 import com.example.data.UserPreferencesRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -60,9 +61,16 @@ data class CadWorkspaceUiState(
     ),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
+    val undoCount: Int = 0,
+    val redoCount: Int = 0,
+    val undoDescription: String? = null,
+    val redoDescription: String? = null,
+    val undoHistoryLabels: List<String> = emptyList(),
+    val redoHistoryLabels: List<String> = emptyList(),
     val statusBannerMessage: String? = null,
     val errorDialogPair: Pair<String, String>? = null,
     val isBusy: Boolean = false,
+    val loadingMessage: String = "Loading CAD Drawing...",
     val commandBarExpanded: Boolean = false,
     val spatialIndex: CadSpatialIndex? = null
 ) {
@@ -116,44 +124,76 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    private val undoStack = ArrayDeque<CadDocument>()
-    private val redoStack = ArrayDeque<CadDocument>()
+    private val undoRedoManager = UndoRedoManager()
     private var autoSaveJob: Job? = null
     private var spatialIndexJob: Job? = null
+    private var loadJob: Job? = null
+    private var loadedKey: Pair<String, Boolean>? = null
+    private var lastRouteLoadKey: Pair<String, Boolean>? = null
+    private var pendingGripDragStartDoc: CadDocument? = null
     private var hasZoomedInitial = false
 
-    fun loadDrawing(drawingId: String, recoverAutosave: Boolean = false) {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isBusy = true) }
-            val loaded = when (drawingId) {
-                "new_blank" -> SampleDrawings.blankDrawing("Drawing_${System.currentTimeMillis() % 1000}")
-                else -> fileRepo.loadDrawingById(drawingId, preferRecovery = recoverAutosave)
-                    ?: SampleDrawings.architecturalStudioFloorPlan()
-            }
-            val initialIndex = withContext(Dispatchers.Default) {
-                CadSpatialIndex.build(loaded.entities, loaded.blocks)
-            }
-            setNewDocument(loaded, prebuiltIndex = initialIndex)
-            if (loaded.importWarnings.isNotEmpty()) {
-                _uiState.update {
-                    it.copy(statusBannerMessage = loaded.importWarnings.first())
+    fun loadDrawing(drawingId: String, recoverAutosave: Boolean = false, forceReload: Boolean = false) {
+        val requestedKey = drawingId to recoverAutosave
+        if (!forceReload && (loadedKey == requestedKey || lastRouteLoadKey == requestedKey)) return
+
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, loadingMessage = "Opening CAD Drawing...") }
+            try {
+                var missingFallback = false
+                val loaded = when (drawingId) {
+                    "new_blank" -> SampleDrawings.blankDrawing("Drawing_${System.currentTimeMillis() % 1000}")
+                    else -> {
+                        val diskOrCached = fileRepo.loadDrawingById(drawingId, preferRecovery = recoverAutosave)
+                        if (diskOrCached != null) {
+                            diskOrCached
+                        } else {
+                            missingFallback = true
+                            SampleDrawings.architecturalStudioFloorPlan()
+                        }
+                    }
                 }
+                val initialIndex = withContext(Dispatchers.Default) {
+                    CadSpatialIndex.build(loaded.entities, loaded.blocks)
+                }
+                loadedKey = requestedKey
+                lastRouteLoadKey = requestedKey
+                setNewDocument(loaded, prebuiltIndex = initialIndex)
+                val banner = when {
+                    loaded.importWarnings.isNotEmpty() -> loaded.importWarnings.first()
+                    missingFallback -> "Saved file was unavailable; opened default architectural plan."
+                    else -> null
+                }
+                if (banner != null) {
+                    _uiState.update { it.copy(statusBannerMessage = banner) }
+                }
+                startAutoSaveLoop()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        errorDialogPair = "Failed to Load Drawing" to (t.message ?: "Unexpected error while reading drawing.")
+                    )
+                }
+            } finally {
+                _uiState.update { it.copy(isBusy = false) }
             }
-            _uiState.update { it.copy(isBusy = false) }
-            startAutoSaveLoop()
         }
     }
 
     fun loadNewDocumentWithParams(name: String, projectGroup: String, units: CadUnits) {
         val doc = SampleDrawings.blankDrawing(name.ifBlank { "Untitled_CAD" }, projectGroup.ifBlank { "Default Project" }, units)
+        loadedKey = doc.id to false
         setNewDocument(doc, prebuiltIndex = CadSpatialIndex.build(doc.entities, doc.blocks))
         viewModelScope.launch { fileRepo.saveDrawingInternal(doc, clearRecovery = true) }
         startAutoSaveLoop()
     }
 
     private fun setNewDocument(doc: CadDocument, prebuiltIndex: CadSpatialIndex? = null) {
-        undoStack.clear()
-        redoStack.clear()
+        undoRedoManager.clear()
+        pendingGripDragStartDoc = null
         hasZoomedInitial = false
         val syncIndex = prebuiltIndex ?: if (doc.entities.size < 1500) {
             CadSpatialIndex.build(doc.entities, doc.blocks)
@@ -169,6 +209,12 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 activeTool = ActiveTool.Select,
                 canUndo = false,
                 canRedo = false,
+                undoCount = 0,
+                redoCount = 0,
+                undoDescription = null,
+                redoDescription = null,
+                undoHistoryLabels = emptyList(),
+                redoHistoryLabels = emptyList(),
                 commandPrompt = "Opened '${doc.name}' (${doc.entities.size} entities, ${doc.layers.size} layers)"
             )
         }
@@ -320,12 +366,11 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         if (state.activeTool is ActiveTool.Select) {
             val gripTol = 24.0 / state.viewport.zoom
             // Check if dragging an object grip on any selected entity
-            for (entity in state.document.entities) {
-                if (!entity.isSelected) continue
+            for (entity in state.selectedEntities) {
                 val grips = GeometryOperations.gripsOf(entity)
                 grips.forEachIndexed { idx, g ->
                     if (g.distanceTo(raw) <= gripTol) {
-                        pushUndoSnapshot(state.document)
+                        pendingGripDragStartDoc = state.document
                         _uiState.update { it.copy(session = it.session.copy(draggingGrip = entity.id to idx), cursorWorld = g) }
                         return
                     }
@@ -366,7 +411,18 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     fun onSingleFingerDragEnd() {
         val state = _uiState.value
         if (state.session.draggingGrip != null) {
-            _uiState.update { it.copy(session = it.session.copy(draggingGrip = null), commandPrompt = "Grip edited") }
+            val startDoc = pendingGripDragStartDoc
+            pendingGripDragStartDoc = null
+            if (startDoc != null && startDoc.entities != state.document.entities) {
+                undoRedoManager.record(startDoc, "Grip Edit")
+                appendHistory("Grip edited")
+            }
+            _uiState.update {
+                it.withUndoState().copy(
+                    session = it.session.copy(draggingGrip = null),
+                    commandPrompt = "Grip edited"
+                )
+            }
             scheduleSpatialIndexRebuild(state.document)
             return
         }
@@ -433,7 +489,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 if (selected.isEmpty()) {
                     _uiState.update { it.copy(activeTool = ActiveTool.Modify(tool), session = ToolSession(), commandPrompt = "${tool.commandName}: Tap entity to delete") }
                 } else {
-                    pushUndoSnapshot(doc)
+                    pushUndoSnapshot(doc, "Erase (${selected.size})")
                     val selIds = selected.map { it.id }.toSet()
                     val remaining = doc.entities.filterNot { it.id in selIds }
                     commitDocChange(doc.copy(entities = remaining, isDirty = true), "Deleted ${selIds.size} entity(ies)")
@@ -444,7 +500,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                     _uiState.update { it.copy(commandPrompt = "EXPLODE: Select polylines, blocks, or dimensions first") }
                     return
                 }
-                pushUndoSnapshot(doc)
+                pushUndoSnapshot(doc, "Explode (${selected.size})")
                 val selIds = selected.map { it.id }.toSet()
                 val next = doc.entities.flatMap { e ->
                     if (e.id in selIds) GeometryOperations.explode(e, doc.blocks) else listOf(e)
@@ -461,7 +517,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                     _uiState.update { it.copy(commandPrompt = "JOIN: Could not join selected geometry") }
                     return
                 }
-                pushUndoSnapshot(doc)
+                pushUndoSnapshot(doc, "Join (${selected.size})")
                 val selIds = selected.map { it.id }.toSet()
                 val next = doc.entities.filterNot { it.id in selIds } + joined
                 commitDocChange(doc.copy(entities = next, isDirty = true), "Joined ${selected.size} entities into Polyline")
@@ -477,12 +533,12 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         if (tool is ActiveTool.Draw) {
             when (tool.tool) {
                 DrawTool.POLYLINE -> if (pts.size >= 2) {
-                    pushUndoSnapshot(state.document)
+                    pushUndoSnapshot(state.document, "Polyline")
                     val poly = CadPolyline(layerName = state.document.currentLayerName, points = pts, isClosed = closeShape)
                     commitDocChange(state.document.copy(entities = state.document.entities + poly, isDirty = true), "PLINE committed (${pts.size} vertices)")
                 }
                 DrawTool.SPLINE -> if (pts.size >= 2) {
-                    pushUndoSnapshot(state.document)
+                    pushUndoSnapshot(state.document, "Spline")
                     val spline = CadSpline(layerName = state.document.currentLayerName, controlPoints = pts, isClosed = closeShape)
                     commitDocChange(state.document.copy(entities = state.document.entities + spline, isDirty = true), "SPLINE committed (${pts.size} control points)")
                 }
@@ -538,7 +594,9 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
             is ParsedCliInput.DeselectAll -> deselectAll()
             is ParsedCliInput.SaveDrawing -> saveDrawing()
             is ParsedCliInput.OpenLayers -> _uiState.update { it.copy(activePanelTab = WorkspacePanelTab.LAYERS) }
-            is ParsedCliInput.Help -> appendHistory("Commands: LINE(L), PLINE(PL), REC, CIRCLE(C), ARC(A), ELLIPSE, SPLINE, MOVE(M), COPY(CO), ROTATE(RO), MIRROR(MI), OFFSET(O), TRIM(TR), EXTEND(EX), FILLET(F), CHAMFER(CHA), SCALE(SC), ARRAY(AR), DIMLINEAR, DIST(DI), AREA, ID, ZE, ZP, PAN, SAVE. Coords: x,y | @dx,dy | @dist<ang")
+            is ParsedCliInput.UndoCommand -> undo(parsed.steps)
+            is ParsedCliInput.RedoCommand -> redo(parsed.steps)
+            is ParsedCliInput.Help -> appendHistory("Commands: LINE(L), PLINE(PL), REC, CIRCLE(C), ARC(A), ELLIPSE, SPLINE, MOVE(M), COPY(CO), ROTATE(RO), MIRROR(MI), OFFSET(O), TRIM(TR), EXTEND(EX), FILLET(F), CHAMFER(CHA), SCALE(SC), ARRAY(AR), UNDO(U), REDO, DIMLINEAR, DIST(DI), AREA, ID, ZE, ZP, PAN, SAVE. Coords: x,y | @dx,dy | @dist<ang")
             is ParsedCliInput.Unknown -> appendHistory("Unknown command '${parsed.raw}'. Type HELP for list.", isError = true)
         }
     }
@@ -577,20 +635,18 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     private fun applyToolOutcome(outcome: ToolStepOutcome, snap: SnapResult) {
         val current = _uiState.value
         if (outcome.shouldCommitHistory && outcome.updatedDocument != null) {
-            pushUndoSnapshot(current.document)
+            pushUndoSnapshot(current.document, outcome.historyLabel ?: current.activeTool.displayName)
         }
         val updatedDoc = outcome.updatedDocument
         _uiState.update {
-            it.copy(
+            it.withUndoState().copy(
                 document = updatedDoc ?: it.document,
                 session = outcome.nextSession,
                 cursorWorld = snap.point,
                 snapResult = snap,
                 measurement = outcome.measurement ?: it.measurement,
                 commandPrompt = outcome.promptMessage,
-                activeTool = if (outcome.resetToSelect) ActiveTool.Select else it.activeTool,
-                canUndo = undoStack.isNotEmpty(),
-                canRedo = redoStack.isNotEmpty()
+                activeTool = if (outcome.resetToSelect) ActiveTool.Select else it.activeTool
             )
         }
         if (updatedDoc != null) {
@@ -599,53 +655,83 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         appendHistory(outcome.promptMessage)
     }
 
-    private fun pushUndoSnapshot(doc: CadDocument) {
-        undoStack.addLast(doc)
-        if (undoStack.size > 50) undoStack.removeFirst()
-        redoStack.clear()
+    private fun pushUndoSnapshot(doc: CadDocument, actionLabel: String = "CAD Edit") {
+        undoRedoManager.record(doc, actionLabel)
     }
 
     private fun commitDocChange(newDoc: CadDocument, message: String) {
         _uiState.update {
-            it.copy(
+            it.withUndoState().copy(
                 document = newDoc,
-                commandPrompt = message,
-                canUndo = undoStack.isNotEmpty(),
-                canRedo = redoStack.isNotEmpty()
+                commandPrompt = message
             )
         }
         scheduleSpatialIndexRebuild(newDoc)
         appendHistory(message)
     }
 
-    fun undo() {
-        val prev = undoStack.removeLastOrNull() ?: return
-        redoStack.addLast(_uiState.value.document)
+    private fun CadWorkspaceUiState.withUndoState(): CadWorkspaceUiState = copy(
+        canUndo = undoRedoManager.canUndo,
+        canRedo = undoRedoManager.canRedo,
+        undoCount = undoRedoManager.undoCount,
+        redoCount = undoRedoManager.redoCount,
+        undoDescription = undoRedoManager.nextUndoLabel,
+        redoDescription = undoRedoManager.nextRedoLabel,
+        undoHistoryLabels = undoRedoManager.undoHistoryLabels(),
+        redoHistoryLabels = undoRedoManager.redoHistoryLabels()
+    )
+
+    fun undo() = undo(1)
+
+    fun undo(steps: Int) {
+        val current = _uiState.value
+        // Support undoing the last picked vertex on buffered multi-point Draw tools (like PLINE/SPLINE)
+        val activeTool = current.activeTool
+        if (steps == 1 &&
+            current.session.collectedPoints.isNotEmpty() &&
+            activeTool is ActiveTool.Draw &&
+            activeTool.tool != DrawTool.LINE
+        ) {
+            val remaining = current.session.collectedPoints.dropLast(1)
+            val msg = "Removed last vertex (${remaining.size} point(s) active)"
+            _uiState.update {
+                it.copy(
+                    session = it.session.copy(collectedPoints = remaining),
+                    commandPrompt = msg
+                )
+            }
+            appendHistory(msg)
+            return
+        }
+
+        val step = undoRedoManager.undoSteps(current.document, steps) ?: return
+        val labelMsg = if (steps > 1) "Undid $steps steps (to ${step.actionLabel})" else "Undid: ${step.actionLabel}"
         _uiState.update {
-            it.copy(
-                document = prev,
+            it.withUndoState().copy(
+                document = step.document,
                 session = ToolSession(),
-                canUndo = undoStack.isNotEmpty(),
-                canRedo = redoStack.isNotEmpty(),
-                commandPrompt = "Undo"
+                commandPrompt = labelMsg
             )
         }
-        scheduleSpatialIndexRebuild(prev)
+        scheduleSpatialIndexRebuild(step.document)
+        appendHistory(labelMsg)
     }
 
-    fun redo() {
-        val next = redoStack.removeLastOrNull() ?: return
-        undoStack.addLast(_uiState.value.document)
+    fun redo() = redo(1)
+
+    fun redo(steps: Int) {
+        val current = _uiState.value
+        val step = undoRedoManager.redoSteps(current.document, steps) ?: return
+        val labelMsg = if (steps > 1) "Redid $steps steps (${step.actionLabel})" else "Redid: ${step.actionLabel}"
         _uiState.update {
-            it.copy(
-                document = next,
+            it.withUndoState().copy(
+                document = step.document,
                 session = ToolSession(),
-                canUndo = undoStack.isNotEmpty(),
-                canRedo = redoStack.isNotEmpty(),
-                commandPrompt = "Redo"
+                commandPrompt = labelMsg
             )
         }
-        scheduleSpatialIndexRebuild(next)
+        scheduleSpatialIndexRebuild(step.document)
+        appendHistory(labelMsg)
     }
 
     fun selectAll() {
@@ -695,13 +781,13 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun updateDimensionStyle(style: DimensionStyle) {
         val doc = _uiState.value.document
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Dimension Style")
         commitDocChange(doc.copy(dimensionStyle = style, units = style.units, isDirty = true), "Updated dimension style")
     }
 
     fun updateUnits(units: CadUnits) {
         val doc = _uiState.value.document
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Change Units")
         commitDocChange(doc.copy(units = units, dimensionStyle = doc.dimensionStyle.copy(units = units), isDirty = true), "Units set to ${units.displayName}")
     }
 
@@ -711,7 +797,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         if (clean.isEmpty()) return
         val doc = _uiState.value.document
         if (doc.layers.any { it.name.equals(clean, ignoreCase = true) }) return
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Create Layer '$clean'")
         val newLayer = CadLayer(name = clean, colorArgb = colorArgb, aciColor = aci)
         commitDocChange(doc.copy(layers = doc.layers + newLayer, currentLayerName = clean, isDirty = true), "Created layer '$clean'")
     }
@@ -722,7 +808,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun updateLayer(oldName: String, transform: (CadLayer) -> CadLayer) {
         val doc = _uiState.value.document
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Update Layer '$oldName'")
         val updatedLayers = doc.layers.map { if (it.name == oldName) transform(it) else it }
         val newLayerName = updatedLayers.firstOrNull { l -> doc.layers.none { it.name == l.name } }?.name
         val updatedEntities = if (newLayerName != null) {
@@ -735,7 +821,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     fun deleteLayer(name: String) {
         if (name == "0") return
         val doc = _uiState.value.document
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Delete Layer '$name'")
         val remaining = doc.layers.filterNot { it.name == name }
         val reassigned = doc.entities.map { if (it.layerName == name) it.copyCommon(layerName = "0") else it }
         val nextCurrent = if (doc.currentLayerName == name) "0" else doc.currentLayerName
@@ -754,7 +840,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     ) {
         val doc = _uiState.value.document
         if (doc.entities.none { it.isSelected }) return
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Edit Properties")
         val updated = doc.entities.map { e ->
             if (!e.isSelected) e
             else e.copyCommon(
@@ -770,7 +856,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun updateSingleEntityGeometry(updatedEntity: CadEntity) {
         val doc = _uiState.value.document
-        pushUndoSnapshot(doc)
+        pushUndoSnapshot(doc, "Edit Geometry")
         val updated = GeometryOperations.updateAssociativeDimensions(
             doc.entities.map { if (it.id == updatedEntity.id) updatedEntity else it }
         )
@@ -787,11 +873,13 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun addLayout() {
         val doc = _uiState.value.document
+        pushUndoSnapshot(doc, "Add Layout")
         val idx = doc.layouts.count { !it.isModelSpace } + 1
         val newLayout = CadLayout(name = "Layout $idx", isModelSpace = false)
-        _uiState.update {
-            it.copy(document = doc.copy(layouts = doc.layouts + newLayout, activeLayoutId = newLayout.id, isDirty = true))
-        }
+        commitDocChange(
+            doc.copy(layouts = doc.layouts + newLayout, activeLayoutId = newLayout.id, isDirty = true),
+            "Added Layout $idx"
+        )
         zoomAll()
     }
 
@@ -799,17 +887,22 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         val clean = newName.trim()
         if (clean.isEmpty()) return
         val doc = _uiState.value.document
+        pushUndoSnapshot(doc, "Rename Layout")
         val updated = doc.layouts.map { if (it.id == layoutId && !it.isModelSpace) it.copy(name = clean) else it }
-        _uiState.update { it.copy(document = doc.copy(layouts = updated, isDirty = true)) }
+        commitDocChange(doc.copy(layouts = updated, isDirty = true), "Renamed layout to '$clean'")
     }
 
     fun deleteLayout(layoutId: String) {
         val doc = _uiState.value.document
         val target = doc.layouts.firstOrNull { it.id == layoutId } ?: return
         if (target.isModelSpace) return
+        pushUndoSnapshot(doc, "Delete Layout '${target.name}'")
         val remaining = doc.layouts.filterNot { it.id == layoutId }
         val nextActive = if (doc.activeLayoutId == layoutId) "model" else doc.activeLayoutId
-        _uiState.update { it.copy(document = doc.copy(layouts = remaining, activeLayoutId = nextActive, isDirty = true)) }
+        commitDocChange(
+            doc.copy(layouts = remaining, activeLayoutId = nextActive, isDirty = true),
+            "Deleted layout '${target.name}'"
+        )
     }
 
     // Saving, Save As, Importing, Exporting
@@ -836,6 +929,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 name = clean
             )
             val saved = fileRepo.saveDrawingInternal(copyDoc, clearRecovery = true)
+            loadedKey = saved.id to false
             _uiState.update {
                 it.copy(
                     document = saved,
@@ -846,24 +940,38 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun importFromUri(uri: Uri) {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isBusy = true) }
-            when (val res = fileRepo.importFromUri(uri)) {
-                is CadImportOutcome.Success -> {
-                    setNewDocument(res.document)
-                    _uiState.update {
-                        it.copy(
-                            isBusy = false,
-                            statusBannerMessage = res.document.importWarnings.firstOrNull()
-                                ?: "Imported '${res.document.name}' (${res.document.entities.size} entities)"
-                        )
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, loadingMessage = "Importing CAD File...") }
+            try {
+                when (val res = fileRepo.importFromUri(uri)) {
+                    is CadImportOutcome.Success -> {
+                        val initialIndex = withContext(Dispatchers.Default) {
+                            CadSpatialIndex.build(res.document.entities, res.document.blocks)
+                        }
+                        loadedKey = res.document.id to false
+                        setNewDocument(res.document, prebuiltIndex = initialIndex)
+                        _uiState.update {
+                            it.copy(
+                                statusBannerMessage = res.document.importWarnings.firstOrNull()
+                                    ?: "Imported '${res.document.name}' (${res.document.entities.size} entities)"
+                            )
+                        }
+                    }
+                    is CadImportOutcome.Error -> {
+                        _uiState.update {
+                            it.copy(errorDialogPair = res.title to res.message)
+                        }
                     }
                 }
-                is CadImportOutcome.Error -> {
-                    _uiState.update {
-                        it.copy(isBusy = false, errorDialogPair = res.title to res.message)
-                    }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(errorDialogPair = "Import Error" to (t.message ?: "Failed to open selected file."))
                 }
+            } finally {
+                _uiState.update { it.copy(isBusy = false) }
             }
         }
     }
@@ -907,6 +1015,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     }
 
     override fun onCleared() {
+        loadJob?.cancel()
         autoSaveJob?.cancel()
         spatialIndexJob?.cancel()
         super.onCleared()

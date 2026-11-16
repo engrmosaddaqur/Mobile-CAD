@@ -54,8 +54,10 @@ object DxfParser {
             return false
         }
 
-        fun d(code: Int, default: Double = 0.0): Double =
-            find(code)?.trim()?.toDoubleOrNull() ?: default
+        fun d(code: Int, default: Double = 0.0): Double {
+            val v = find(code)?.trim()?.toDoubleOrNull() ?: return default
+            return if (v.isFinite()) v else default
+        }
 
         fun s(code: Int, default: String = ""): String =
             find(code)?.trim() ?: default
@@ -96,6 +98,9 @@ object DxfParser {
                 if (codeLine.isNotEmpty() && codeLine[0] == '\uFEFF') {
                     codeLine = codeLine.substring(1)
                 }
+            }
+            while (codeLine.isBlank()) {
+                codeLine = reader.readLine() ?: return false
             }
             val valLine = reader.readLine() ?: return false
             val parsedCode = codeLine.trim().toIntOrNull() ?: return false

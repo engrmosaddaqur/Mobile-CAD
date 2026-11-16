@@ -1,5 +1,8 @@
 package com.example.ui.screens
 
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -22,25 +25,34 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.example.cad.io.DefaultDwgSdkBridge
 import com.example.cad.model.CadUnits
 import com.example.cad.model.CanvasBackgroundTheme
@@ -50,7 +62,10 @@ import com.example.ui.theme.AppThemeMode
 import com.example.ui.theme.CadAmber
 import com.example.ui.theme.CadEmerald
 import com.example.ui.theme.JetBrainsMonoFamily
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -60,8 +75,30 @@ fun SettingsScreen(
     onNavigateBack: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    val saveApkLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val resultMsg = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val src = File(context.applicationInfo.sourceDir)
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            src.inputStream().use { input -> input.copyTo(out) }
+                        } ?: error("Cannot open destination stream")
+                        "APK saved successfully (${src.length() / (1024 * 1024)} MB)"
+                    }.getOrElse { "APK save failed: ${it.message}" }
+                }
+                snackbarHostState.showSnackbar(resultMsg)
+            }
+        }
+    }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text("CAD Settings") },
@@ -215,6 +252,57 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.labelSmall,
                             color = if (sdkLoaded) CadEmerald else CadAmber
                         )
+                    }
+                }
+            }
+
+            item {
+                SettingSectionCard("App APK Export & Backup") {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            "Save a copy of the MOBILE CAD installer (.apk) to device storage or share it directly.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { saveApkLauncher.launch("MOBILE_CAD_v1.0.apk") },
+                                modifier = Modifier.weight(1f).testTag("export_apk_btn")
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Save APK")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        val shareResult = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                val exportDir = File(context.cacheDir, "exports").apply { mkdirs() }
+                                                val destApk = File(exportDir, "MOBILE_CAD_v1.0.apk")
+                                                File(context.applicationInfo.sourceDir).copyTo(destApk, overwrite = true)
+                                                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", destApk)
+                                            }
+                                        }
+                                        shareResult.onSuccess { uri ->
+                                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                                type = "application/vnd.android.package-archive"
+                                                putExtra(Intent.EXTRA_STREAM, uri)
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                            context.startActivity(Intent.createChooser(intent, "Share MOBILE CAD APK"))
+                                        }.onFailure { err ->
+                                            snackbarHostState.showSnackbar("Share failed: ${err.message}")
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f).testTag("share_apk_btn")
+                            ) {
+                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Share APK")
+                            }
+                        }
                     }
                 }
             }

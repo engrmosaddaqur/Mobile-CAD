@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">MOBILE CAD</string>
+    <string name="tagline">Professional CAD Design in Your Pocket</string>
+    <string name="action_new_drawing">New Drawing</string>
+    <string name="action_open_drawing">Open Drawing</string>
+    <string name="action_browse_files">Browse Files</string>
+    <string name="action_new_project">Create New Project</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_help">Help &amp; Tutorials</string>
+    <string name="recent_drawings">Recent Drawings</string>
+    <string name="empty_recent_title">No Recent Drawings</string>
+    <string name="empty_recent_subtitle">Create a new drawing, start from a template, or open a DXF/DWG file from your device.</string>
+    <string name="cd_app_logo">MOBILE CAD logo</string>
+    <string name="cd_hero_blueprint">Engineering CAD blueprint preview</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_save">Save drawing</string>
+    <string name="cd_undo">Undo last action</string>
+    <string name="cd_redo">Redo action</string>
+    <string name="cd_more_options">More options</string>
+</resources>

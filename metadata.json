@@ -1,0 +1,6 @@
+{
+  "name": "MOBILE CAD",
+  "description": "Professional CAD Design in Your Pocket — 2D CAD drafting, DXF/DWG editing, precision snapping, layers, dimensions, and PDF/SVG/PNG/JPG export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

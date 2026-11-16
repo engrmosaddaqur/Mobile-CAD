@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -29,10 +32,13 @@ jobs:
             echo "$HOME/.gradle-dist/gradle-9.3.1/bin" >> "$GITHUB_PATH"
           fi
 
-      - name: Prepare Android SDK Licenses & Debug Keystore
+      - name: Prepare Android SDK Permissions, Licenses & Debug Keystore
         run: |
           SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           if [ -n "$SDK_DIR" ]; then
+            if [ ! -w "$SDK_DIR" ]; then
+              sudo chown -R "$(id -u):$(id -g)" "$SDK_DIR" || true
+            fi
             mkdir -p "$SDK_DIR/licenses" || true
             printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" > "$SDK_DIR/licenses/android-sdk-license" || true
             printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$SDK_DIR/licenses/android-sdk-preview-license" || true
@@ -51,10 +57,24 @@ jobs:
           fi
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: |
+          gradle :app:assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/MOBILE_CAD-debug.apk
 
-      - name: Upload Downloadable APK
+      - name: Upload Downloadable APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MOBILE_CAD-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/MOBILE_CAD-debug.apk
+
+      - name: Publish Direct APK to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        continue-on-error: true
+        with:
+          tag_name: latest-apk
+          name: MOBILE CAD Latest APK
+          body: Direct installable APK for MOBILE CAD (built automatically by GitHub Actions).
+          make_latest: true
+          files: app/build/outputs/apk/debug/MOBILE_CAD-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

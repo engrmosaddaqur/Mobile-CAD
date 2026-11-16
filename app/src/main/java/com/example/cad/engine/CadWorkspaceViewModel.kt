@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.cad.geometry.CadSpatialIndex
 import com.example.cad.geometry.GeometryEngine
 import com.example.cad.geometry.GeometryOperations
 import com.example.cad.geometry.SnapEngine
@@ -30,6 +31,7 @@ import com.example.data.CadImportOutcome
 import com.example.data.ExportFormat
 import com.example.data.UserPreferences
 import com.example.data.UserPreferencesRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,6 +39,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.max
 
 data class CadWorkspaceUiState(
@@ -60,10 +63,23 @@ data class CadWorkspaceUiState(
     val statusBannerMessage: String? = null,
     val errorDialogPair: Pair<String, String>? = null,
     val isBusy: Boolean = false,
-    val commandBarExpanded: Boolean = false
+    val commandBarExpanded: Boolean = false,
+    val spatialIndex: CadSpatialIndex? = null
 ) {
     val selectedEntities: List<CadEntity>
-        get() = document.entities.filter { it.isSelected }
+        get() {
+            val idx = spatialIndex
+            return if (idx != null && idx.entityCount == document.entities.size) {
+                val out = ArrayList<CadEntity>(idx.selectedIndices.size)
+                for (i in idx.selectedIndices) {
+                    val e = document.entities[i]
+                    if (e.isSelected) out.add(e)
+                }
+                out
+            } else {
+                document.entities.filter { it.isSelected }
+            }
+        }
 
     val previewGeometry: PreviewGeometry
         get() = CadToolExecutor.buildPreview(
@@ -103,6 +119,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
     private val undoStack = ArrayDeque<CadDocument>()
     private val redoStack = ArrayDeque<CadDocument>()
     private var autoSaveJob: Job? = null
+    private var spatialIndexJob: Job? = null
     private var hasZoomedInitial = false
 
     fun loadDrawing(drawingId: String, recoverAutosave: Boolean = false) {
@@ -113,7 +130,10 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 else -> fileRepo.loadDrawingById(drawingId, preferRecovery = recoverAutosave)
                     ?: SampleDrawings.architecturalStudioFloorPlan()
             }
-            setNewDocument(loaded)
+            val initialIndex = withContext(Dispatchers.Default) {
+                CadSpatialIndex.build(loaded.entities, loaded.blocks)
+            }
+            setNewDocument(loaded, prebuiltIndex = initialIndex)
             if (loaded.importWarnings.isNotEmpty()) {
                 _uiState.update {
                     it.copy(statusBannerMessage = loaded.importWarnings.first())
@@ -126,18 +146,25 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun loadNewDocumentWithParams(name: String, projectGroup: String, units: CadUnits) {
         val doc = SampleDrawings.blankDrawing(name.ifBlank { "Untitled_CAD" }, projectGroup.ifBlank { "Default Project" }, units)
-        setNewDocument(doc)
+        setNewDocument(doc, prebuiltIndex = CadSpatialIndex.build(doc.entities, doc.blocks))
         viewModelScope.launch { fileRepo.saveDrawingInternal(doc, clearRecovery = true) }
         startAutoSaveLoop()
     }
 
-    private fun setNewDocument(doc: CadDocument) {
+    private fun setNewDocument(doc: CadDocument, prebuiltIndex: CadSpatialIndex? = null) {
         undoStack.clear()
         redoStack.clear()
         hasZoomedInitial = false
+        val syncIndex = prebuiltIndex ?: if (doc.entities.size < 1500) {
+            CadSpatialIndex.build(doc.entities, doc.blocks)
+        } else null
+
         _uiState.update {
+            val bounds = syncIndex?.totalBounds ?: GeometryEngine.boundsOfAll(doc.entities, doc.blocks)
             it.copy(
                 document = doc,
+                spatialIndex = syncIndex,
+                viewport = it.viewport.zoomToBounds(bounds),
                 session = ToolSession(),
                 activeTool = ActiveTool.Select,
                 canUndo = false,
@@ -145,7 +172,28 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 commandPrompt = "Opened '${doc.name}' (${doc.entities.size} entities, ${doc.layers.size} layers)"
             )
         }
-        zoomExtents()
+        if (syncIndex == null) {
+            scheduleSpatialIndexRebuild(doc)
+        }
+    }
+
+    private fun scheduleSpatialIndexRebuild(doc: CadDocument) {
+        spatialIndexJob?.cancel()
+        if (doc.entities.size < 1500) {
+            val idx = CadSpatialIndex.build(doc.entities, doc.blocks)
+            _uiState.update { state ->
+                if (state.document === doc) state.copy(spatialIndex = idx) else state
+            }
+            return
+        }
+        spatialIndexJob = viewModelScope.launch {
+            val idx = withContext(Dispatchers.Default) {
+                CadSpatialIndex.build(doc.entities, doc.blocks)
+            }
+            _uiState.update { state ->
+                if (state.document === doc) state.copy(spatialIndex = idx) else state
+            }
+        }
     }
 
     private fun startAutoSaveLoop() {
@@ -168,7 +216,8 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
             val nextVp = state.viewport.copy(viewWidthPx = width, viewHeightPx = height)
             if (!hasZoomedInitial) {
                 hasZoomedInitial = true
-                val bounds = GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks)
+                val bounds = state.spatialIndex?.totalBounds
+                    ?: GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks)
                 state.copy(viewport = nextVp.zoomToBounds(bounds))
             } else {
                 state.copy(viewport = nextVp)
@@ -196,7 +245,8 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     fun zoomExtents() {
         _uiState.update { state ->
-            val bounds = GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks)
+            val bounds = state.spatialIndex?.totalBounds
+                ?: GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks)
             state.copy(viewport = state.viewport.zoomToBounds(bounds))
         }
     }
@@ -207,7 +257,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
             val bounds = if (!layout.isModelSpace) {
                 com.example.cad.model.Bounds2D(-layout.paperWidthMm * 0.55, -layout.paperHeightMm * 0.55, layout.paperWidthMm * 0.55, layout.paperHeightMm * 0.55)
             } else {
-                GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks).expand(30.0)
+                (state.spatialIndex?.totalBounds ?: GeometryEngine.boundsOfAll(state.document.entities, state.document.blocks)).expand(30.0)
             }
             state.copy(viewport = state.viewport.zoomToBounds(bounds))
         }
@@ -232,19 +282,21 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
         if (state.activeTool is ActiveTool.Select || state.activeTool is ActiveTool.RectSelect) {
             val visibleLayers = state.document.layers.filter { it.isOn && !it.isFrozen }.map { it.name }.toSet()
-            val hit = GeometryEngine.hitTest(raw, state.document.entities, tol, state.document.blocks, visibleLayers)
+            val hit = GeometryEngine.hitTest(raw, state.document.entities, tol, state.document.blocks, visibleLayers, state.spatialIndex)
             val updated = state.document.entities.map { entity ->
                 if (hit != null && entity.id == hit.id) entity.copyCommon(isSelected = !entity.isSelected)
                 else entity
             }
             val selCount = updated.count { it.isSelected }
+            val nextDoc = state.document.copy(entities = updated)
             _uiState.update {
                 it.copy(
-                    document = it.document.copy(entities = updated),
+                    document = nextDoc,
                     cursorWorld = raw,
                     commandPrompt = if (hit != null) "Selected $selCount object(s) [${hit.layerName}]" else "Tap entity to select or drag Window/Crossing box"
                 )
             }
+            scheduleSpatialIndexRebuild(nextDoc)
             return
         }
 
@@ -315,6 +367,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         val state = _uiState.value
         if (state.session.draggingGrip != null) {
             _uiState.update { it.copy(session = it.session.copy(draggingGrip = null), commandPrompt = "Grip edited") }
+            scheduleSpatialIndexRebuild(state.document)
             return
         }
         val rect = state.rectSelectionDrag ?: return
@@ -335,19 +388,21 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
             return
         }
         val visibleLayers = state.document.layers.filter { it.isOn && !it.isFrozen }.map { it.name }.toSet()
-        val ids = GeometryEngine.selectByRect(rect.first, rect.second, state.document.entities, state.document.blocks, visibleLayers)
+        val ids = GeometryEngine.selectByRect(rect.first, rect.second, state.document.entities, state.document.blocks, visibleLayers, state.spatialIndex)
         val updated = state.document.entities.map { e ->
             if (e.id in ids) e.copyCommon(isSelected = true) else e
         }
+        val nextDoc = state.document.copy(entities = updated)
         val modeName = if (rect.second.x >= rect.first.x) "Window" else "Crossing"
         _uiState.update {
             it.copy(
-                document = it.document.copy(entities = updated),
+                document = nextDoc,
                 rectSelectionDrag = null,
                 activeTool = ActiveTool.Select,
                 commandPrompt = "$modeName select: ${ids.size} entity(ies) added"
             )
         }
+        scheduleSpatialIndexRebuild(nextDoc)
     }
 
     fun selectTool(tool: ActiveTool) {
@@ -524,9 +579,10 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
         if (outcome.shouldCommitHistory && outcome.updatedDocument != null) {
             pushUndoSnapshot(current.document)
         }
+        val updatedDoc = outcome.updatedDocument
         _uiState.update {
             it.copy(
-                document = outcome.updatedDocument ?: it.document,
+                document = updatedDoc ?: it.document,
                 session = outcome.nextSession,
                 cursorWorld = snap.point,
                 snapResult = snap,
@@ -536,6 +592,9 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 canUndo = undoStack.isNotEmpty(),
                 canRedo = redoStack.isNotEmpty()
             )
+        }
+        if (updatedDoc != null) {
+            scheduleSpatialIndexRebuild(updatedDoc)
         }
         appendHistory(outcome.promptMessage)
     }
@@ -555,6 +614,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 canRedo = redoStack.isNotEmpty()
             )
         }
+        scheduleSpatialIndexRebuild(newDoc)
         appendHistory(message)
     }
 
@@ -570,6 +630,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 commandPrompt = "Undo"
             )
         }
+        scheduleSpatialIndexRebuild(prev)
     }
 
     fun redo() {
@@ -584,21 +645,28 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
                 commandPrompt = "Redo"
             )
         }
+        scheduleSpatialIndexRebuild(next)
     }
 
     fun selectAll() {
-        _uiState.update { state ->
-            val visible = state.document.layers.filter { it.isOn && !it.isFrozen }.map { it.name }.toSet()
-            val updated = state.document.entities.map { if (it.layerName in visible) it.copyCommon(isSelected = true) else it }
-            state.copy(document = state.document.copy(entities = updated), commandPrompt = "Selected ${updated.count { it.isSelected }} objects")
+        val state = _uiState.value
+        val visible = state.document.layers.filter { it.isOn && !it.isFrozen }.map { it.name }.toSet()
+        val updated = state.document.entities.map { if (it.layerName in visible) it.copyCommon(isSelected = true) else it }
+        val nextDoc = state.document.copy(entities = updated)
+        _uiState.update {
+            it.copy(document = nextDoc, commandPrompt = "Selected ${updated.count { e -> e.isSelected }} objects")
         }
+        scheduleSpatialIndexRebuild(nextDoc)
     }
 
     fun deselectAll() {
-        _uiState.update { state ->
-            val updated = state.document.entities.map { it.copyCommon(isSelected = false) }
-            state.copy(document = state.document.copy(entities = updated), commandPrompt = "Selection cleared")
+        val state = _uiState.value
+        val updated = state.document.entities.map { it.copyCommon(isSelected = false) }
+        val nextDoc = state.document.copy(entities = updated)
+        _uiState.update {
+            it.copy(document = nextDoc, commandPrompt = "Selection cleared")
         }
+        scheduleSpatialIndexRebuild(nextDoc)
     }
 
     fun setActivePanelTab(tab: WorkspacePanelTab?) {
@@ -825,7 +893,8 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
             blocks = state.document.blocks,
             visibleLayerNames = visibleLayers,
             snapSettings = state.snapSettings,
-            snapToleranceWorld = tolWorld
+            snapToleranceWorld = tolWorld,
+            spatialIndex = state.spatialIndex
         )
     }
 
@@ -839,6 +908,7 @@ class CadWorkspaceViewModel(application: Application) : AndroidViewModel(applica
 
     override fun onCleared() {
         autoSaveJob?.cancel()
+        spatialIndexJob?.cancel()
         super.onCleared()
     }
 }

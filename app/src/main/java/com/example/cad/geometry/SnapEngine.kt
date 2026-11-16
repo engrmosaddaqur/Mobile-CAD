@@ -29,32 +29,52 @@ object SnapEngine {
         blocks: Map<String, CadBlockDefinition>,
         visibleLayerNames: Set<String>,
         snapSettings: SnapSettings,
-        snapToleranceWorld: Double
+        snapToleranceWorld: Double,
+        spatialIndex: CadSpatialIndex? = null
     ): SnapResult {
         var bestPoint = rawWorldPoint
         var bestOsnap: OsnapType? = null
         var bestDist = snapToleranceWorld
         var trackingGuide: Pair<Vec2, Vec2>? = null
 
-        val visibleEntities = entities.filter { it.layerName in visibleLayerNames }
+        val queryRadius = snapToleranceWorld * 3.5
+        val visibleNearbyEntities: List<CadEntity> = if (spatialIndex != null && spatialIndex.entityCount == entities.size) {
+            val box = com.example.cad.model.Bounds2D(
+                rawWorldPoint.x - queryRadius,
+                rawWorldPoint.y - queryRadius,
+                rawWorldPoint.x + queryRadius,
+                rawWorldPoint.y + queryRadius
+            )
+            val hits = IntArrayList(64)
+            val stamp = spatialIndex.newStampBuffer()
+            spatialIndex.queryBounds(box, hits, stamp, 1)
+            val out = ArrayList<CadEntity>(hits.size)
+            for (k in 0 until hits.size) {
+                val e = entities[hits[k]]
+                if (e.layerName in visibleLayerNames) out.add(e)
+            }
+            out
+        } else {
+            entities.filter { it.layerName in visibleLayerNames }
+        }
 
         // 1. Apply OSNAP candidates
         if (snapSettings.osnapEnabled && snapSettings.enabledOsnaps.isNotEmpty()) {
             val candidates = mutableListOf<Pair<OsnapType, Vec2>>()
 
-            for (entity in visibleEntities) {
-                if (GeometryEngine.distanceToEntity(rawWorldPoint, entity, blocks) > snapToleranceWorld * 3.5) {
+            for (entity in visibleNearbyEntities) {
+                if (GeometryEngine.distanceToEntity(rawWorldPoint, entity, blocks) > queryRadius) {
                     continue
                 }
                 collectEntityOsnaps(entity, anchorPoint, rawWorldPoint, snapSettings.enabledOsnaps, blocks, candidates)
             }
 
             if (OsnapType.INTERSECTION in snapSettings.enabledOsnaps) {
-                collectIntersections(rawWorldPoint, visibleEntities, blocks, snapToleranceWorld * 2.5, candidates)
+                collectIntersections(rawWorldPoint, visibleNearbyEntities, blocks, snapToleranceWorld * 2.5, candidates)
             }
 
-            val exactCandidates = candidates.filter { it.first != OsnapType.NEAREST }
-            for ((type, pt) in exactCandidates) {
+            for ((type, pt) in candidates) {
+                if (type == OsnapType.NEAREST) continue
                 val d = rawWorldPoint.distanceTo(pt)
                 if (d < bestDist) {
                     bestDist = d
@@ -107,7 +127,7 @@ object SnapEngine {
 
             // Extension snap along nearby line directions
             if (snapSettings.osnapEnabled && OsnapType.EXTENSION in snapSettings.enabledOsnaps && trackingGuide == null) {
-                for (entity in visibleEntities) {
+                for (entity in visibleNearbyEntities) {
                     if (entity is CadLine) {
                         val dir = (entity.end - entity.start).normalized()
                         val (d, proj) = GeometryEngine.pointToInfiniteLineDistance(constrained, entity.start, dir, rayOnly = false)

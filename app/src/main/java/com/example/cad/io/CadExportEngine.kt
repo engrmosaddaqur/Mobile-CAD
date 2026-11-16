@@ -200,7 +200,8 @@ object CadExportEngine {
         widthPx: Int = 480,
         heightPx: Int = 320,
         backgroundColor: Int = Color.rgb(11, 16, 23),
-        invertWhiteLines: Boolean = false
+        invertWhiteLines: Boolean = false,
+        precomputedBounds: Bounds2D? = null
     ): Bitmap {
         val bmp = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
@@ -211,7 +212,9 @@ object CadExportEngine {
             heightPx = heightPx,
             backgroundColor = backgroundColor,
             invertWhiteLines = invertWhiteLines,
-            drawTitleBlock = false
+            drawTitleBlock = false,
+            precomputedBounds = precomputedBounds,
+            isThumbnail = true
         )
         return bmp
     }
@@ -317,10 +320,12 @@ object CadExportEngine {
         heightPx: Int,
         backgroundColor: Int,
         invertWhiteLines: Boolean,
-        drawTitleBlock: Boolean
+        drawTitleBlock: Boolean,
+        precomputedBounds: Bounds2D? = null,
+        isThumbnail: Boolean = false
     ) {
         canvas.drawColor(backgroundColor)
-        val bounds = GeometryEngine.boundsOfAll(doc.entities, doc.blocks)
+        val bounds = precomputedBounds ?: GeometryEngine.boundsOfAll(doc.entities, doc.blocks)
         val pad = if (drawTitleBlock) 48f else max(16f, min(widthPx, heightPx) * 0.08f)
         val availW = max(10f, widthPx - pad * 2f)
         val availH = max(10f, heightPx - pad * 2f - (if (drawTitleBlock) 54f else 0f))
@@ -344,7 +349,14 @@ object CadExportEngine {
             isSubpixelText = true
         }
 
-        for (entity in doc.entities) {
+        val step = if (isThumbnail && doc.entities.size > 3500) {
+            max(1, doc.entities.size / 3500)
+        } else 1
+
+        var idx = 0
+        while (idx < doc.entities.size) {
+            val entity = doc.entities[idx]
+            idx += step
             val layer: CadLayer? = layerMap[entity.layerName.uppercase()]
             if (layer != null && (!layer.isOn || layer.isFrozen)) continue
 
@@ -357,7 +369,7 @@ object CadExportEngine {
             val lw = entity.lineWeightMm ?: layer?.lineWeightMm ?: 0.25f
             paint.strokeWidth = max(1.2f, lw * 4.2f)
             val lt = entity.lineType ?: layer?.lineType ?: CadLineType.CONTINUOUS
-            paint.pathEffect = lt.dashPatternPx?.let { DashPathEffect(it, 0f) }
+            paint.pathEffect = if (isThumbnail) null else lt.dashPatternPx?.let { DashPathEffect(it, 0f) }
 
             drawEntityOnCanvas(entity, doc, canvas, paint, textPaint, ::toX, ::toY, scale, invertWhiteLines)
         }

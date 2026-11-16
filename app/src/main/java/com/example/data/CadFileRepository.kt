@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.LruCache
+import com.example.cad.geometry.GeometryEngine
 import com.example.cad.io.CadExportEngine
 import com.example.cad.io.DwgEngine
 import com.example.cad.io.DwgOperationResult
@@ -15,6 +17,7 @@ import com.example.cad.model.CadSourceFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -22,6 +25,24 @@ import java.io.FileOutputStream
 sealed class CadImportOutcome {
     data class Success(val document: CadDocument) : CadImportOutcome()
     data class Error(val title: String, val message: String) : CadImportOutcome()
+}
+
+/**
+ * Process-wide LRU handoff cache so opening a recently imported, created, or edited drawing
+ * skips redundant disk DXF re-parsing on Workspace entry.
+ */
+object CadDocumentMemoryCache {
+    private val cache = object : LruCache<String, CadDocument>(4) {}
+
+    fun put(doc: CadDocument) {
+        cache.put(doc.id, doc)
+    }
+
+    fun get(id: String): CadDocument? = cache.get(id)
+
+    fun remove(id: String) {
+        cache.remove(id)
+    }
 }
 
 class CadFileRepository(
@@ -52,6 +73,9 @@ class CadFileRepository(
     }
 
     suspend fun loadDrawingById(id: String, preferRecovery: Boolean = false): CadDocument? = withContext(Dispatchers.IO) {
+        if (!preferRecovery) {
+            CadDocumentMemoryCache.get(id)?.let { return@withContext it }
+        }
         val entry = dao.getById(id) ?: return@withContext null
         val targetFile = if (preferRecovery && entry.hasUnsavedRecovery && File(entry.autosavePath).exists()) {
             File(entry.autosavePath)
@@ -60,14 +84,16 @@ class CadFileRepository(
         }
         if (!targetFile.exists()) return@withContext null
         FileInputStream(targetFile).use { fis ->
-            val doc = DxfParser.parse(fis, entry.name)
-            doc.copy(
+            val parsed = DxfParser.parse(fis, entry.name)
+            val result = parsed.copy(
                 id = entry.id,
                 projectGroup = entry.projectGroup,
                 sourceFormat = runCatching { CadSourceFormat.valueOf(entry.format) }.getOrDefault(CadSourceFormat.DXF),
                 lastModifiedMs = entry.lastModifiedMs,
                 isDirty = preferRecovery && entry.hasUnsavedRecovery
             )
+            CadDocumentMemoryCache.put(result)
+            result
         }
     }
 
@@ -82,14 +108,20 @@ class CadFileRepository(
             mainFile.copyTo(backupFile, overwrite = true)
         }
 
+        val bounds = GeometryEngine.boundsOfAll(doc.entities, doc.blocks)
         FileOutputStream(mainFile).use { fos ->
-            DxfWriter.write(doc, fos)
+            DxfWriter.write(doc, fos, precomputedBounds = bounds)
         }
         if (clearRecovery && autosaveFile.exists()) {
             autosaveFile.delete()
         }
 
-        val thumbBmp = CadExportEngine.renderThumbnailBitmap(doc, widthPx = 420, heightPx = 280)
+        val thumbBmp = CadExportEngine.renderThumbnailBitmap(
+            doc = doc,
+            widthPx = 420,
+            heightPx = 280,
+            precomputedBounds = bounds
+        )
         FileOutputStream(thumbFile).use { fos ->
             thumbBmp.compress(Bitmap.CompressFormat.PNG, 90, fos)
         }
@@ -110,7 +142,9 @@ class CadFileRepository(
                 lastModifiedMs = now
             )
         )
-        doc.copy(lastModifiedMs = now, isDirty = !clearRecovery)
+        val savedDoc = doc.copy(lastModifiedMs = now, isDirty = !clearRecovery)
+        CadDocumentMemoryCache.put(savedDoc)
+        savedDoc
     }
 
     suspend fun writeAutoSave(doc: CadDocument) = withContext(Dispatchers.IO) {
@@ -138,6 +172,7 @@ class CadFileRepository(
                 lastModifiedMs = System.currentTimeMillis()
             )
         )
+        CadDocumentMemoryCache.put(doc)
     }
 
     suspend fun discardRecovery(id: String) = withContext(Dispatchers.IO) {
@@ -149,10 +184,15 @@ class CadFileRepository(
     }
 
     suspend fun renameDrawing(id: String, newName: String) = withContext(Dispatchers.IO) {
-        dao.rename(id, newName.trim(), System.currentTimeMillis())
+        val trimmed = newName.trim()
+        dao.rename(id, trimmed, System.currentTimeMillis())
+        CadDocumentMemoryCache.get(id)?.let { cached ->
+            CadDocumentMemoryCache.put(cached.copy(name = trimmed))
+        }
     }
 
     suspend fun deleteDrawing(id: String) = withContext(Dispatchers.IO) {
+        CadDocumentMemoryCache.remove(id)
         val entry = dao.getById(id)
         entry?.let {
             File(it.filePath).delete()
@@ -163,33 +203,45 @@ class CadFileRepository(
     }
 
     suspend fun importFromUri(uri: Uri): CadImportOutcome = withContext(Dispatchers.IO) {
-        val displayName = resolveFileName(uri) ?: "Imported_Drawing.dxf"
-        val baseName = displayName.substringBeforeLast(".")
-        val ext = displayName.substringAfterLast(".", "dxf").lowercase()
+        val displayName = resolveFileName(uri) ?: "Imported_Drawing"
+        val baseName = displayName.substringBeforeLast(".").ifBlank { displayName }
+        val ext = displayName.substringAfterLast(".", "").lowercase()
 
         return@withContext try {
             val stream = context.contentResolver.openInputStream(uri)
                 ?: return@withContext CadImportOutcome.Error("Import Failed", "Could not open file stream.")
 
-            stream.use { input ->
-                if (ext == "dwg") {
-                    when (val res = DwgEngine.readDwg(input, baseName, uri.toString())) {
-                        is DwgOperationResult.Success -> {
-                            val saved = saveDrawingInternal(res.document, clearRecovery = true)
-                            CadImportOutcome.Success(saved)
-                        }
-                        is DwgOperationResult.UnsupportedBinaryDwg -> {
-                            CadImportOutcome.Error(
-                                title = "Native DWG SDK Required (${res.detectedVersion})",
-                                message = res.diagnosticMessage
-                            )
-                        }
+            val bytes = stream.use { it.readBytes() }
+            if (bytes.isEmpty()) {
+                return@withContext CadImportOutcome.Error("Import Failed", "Selected CAD file is empty.")
+            }
+
+            // Sniff magic header bytes so Android content URIs without a .dwg extension still route to DwgEngine
+            val hasDwgSignature = bytes.size >= 6 &&
+                bytes[0] == 'A'.code.toByte() &&
+                bytes[1] == 'C'.code.toByte() &&
+                bytes[2] == '1'.code.toByte() &&
+                bytes[3] == '0'.code.toByte()
+
+            val isDwgFile = (ext == "dwg" || hasDwgSignature) && !DwgEngine.isAsciiDxfPayload(bytes)
+
+            if (isDwgFile || ext == "dwg") {
+                when (val res = DwgEngine.readDwg(ByteArrayInputStream(bytes), baseName, uri.toString())) {
+                    is DwgOperationResult.Success -> {
+                        val saved = saveDrawingInternal(res.document, clearRecovery = true)
+                        CadImportOutcome.Success(saved)
                     }
-                } else {
-                    val parsed = DxfParser.parse(input, baseName, uri.toString())
-                    val saved = saveDrawingInternal(parsed, clearRecovery = true)
-                    CadImportOutcome.Success(saved)
+                    is DwgOperationResult.UnsupportedBinaryDwg -> {
+                        CadImportOutcome.Error(
+                            title = "DWG Compatibility (${res.detectedVersion})",
+                            message = res.diagnosticMessage
+                        )
+                    }
                 }
+            } else {
+                val parsed = DxfParser.parse(ByteArrayInputStream(bytes), baseName, uri.toString())
+                val saved = saveDrawingInternal(parsed, clearRecovery = true)
+                CadImportOutcome.Success(saved)
             }
         } catch (e: Exception) {
             CadImportOutcome.Error("CAD Parse Error", e.message ?: "Malformed CAD file.")
@@ -206,7 +258,7 @@ class CadFileRepository(
                     ExportFormat.DWG -> {
                         val ok = DwgEngine.writeDwg(doc, os)
                         if (!ok) {
-                            error("Native LibreDWG / ODA SDK binary is not linked for binary DWG encoding. Use DXF export for full AutoCAD/BricsCAD compatibility.")
+                            error("Binary DWG writing requires native LibreDWG / ODA SDK. Use DXF export for full AutoCAD/BricsCAD compatibility.")
                         }
                     }
                     ExportFormat.PDF -> CadExportEngine.exportToPdf(doc, os, whitePaper = true)
@@ -232,7 +284,7 @@ class CadFileRepository(
 
 enum class ExportFormat(val extension: String, val mimeType: String, val label: String) {
     DXF("dxf", "application/dxf", "AutoCAD DXF (AC1024)"),
-    DWG("dwg", "application/acad", "DWG (Requires Native SDK)"),
+    DWG("dwg", "application/acad", "DWG (Requires Native Writer)"),
     PDF("pdf", "application/pdf", "Vector PDF"),
     SVG("svg", "image/svg+xml", "Vector SVG"),
     PNG("png", "image/png", "PNG Image"),

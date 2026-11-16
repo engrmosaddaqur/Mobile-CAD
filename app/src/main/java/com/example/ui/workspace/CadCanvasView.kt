@@ -194,7 +194,8 @@ fun CadCanvasView(
                 bgTheme = canvasTheme,
                 cursorWorld = state.cursorWorld,
                 snapResult = state.snapResult,
-                preview = state.previewGeometry
+                preview = state.previewGeometry,
+                spatialIndex = state.spatialIndex
             )
         }
 

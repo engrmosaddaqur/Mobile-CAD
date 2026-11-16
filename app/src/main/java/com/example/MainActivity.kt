@@ -40,6 +40,7 @@ class MainActivity : ComponentActivity() {
             val recentDrawings by homeViewModel.recentDrawings.collectAsStateWithLifecycle()
             val pendingRecovery by homeViewModel.pendingRecovery.collectAsStateWithLifecycle()
             val importError by homeViewModel.importError.collectAsStateWithLifecycle()
+            val isHomeBusy by homeViewModel.isBusy.collectAsStateWithLifecycle()
 
             val navController = rememberNavController()
             val prefsRepo = UserPreferencesRepository(applicationContext)
@@ -70,6 +71,7 @@ class MainActivity : ComponentActivity() {
                             recentDrawings = recentDrawings,
                             pendingRecovery = pendingRecovery,
                             importError = importError,
+                            isBusy = isHomeBusy,
                             defaultUnits = prefs.defaultUnits,
                             onNewDrawing = {
                                 homeViewModel.createNewDrawing(

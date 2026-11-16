@@ -41,6 +41,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -89,6 +90,7 @@ fun HomeScreen(
     recentDrawings: List<RecentDrawingEntity>,
     pendingRecovery: RecentDrawingEntity?,
     importError: Pair<String, String>?,
+    isBusy: Boolean = false,
     defaultUnits: CadUnits,
     onNewDrawing: () -> Unit,
     onOpenDrawingPicker: () -> Unit,
@@ -124,14 +126,19 @@ fun HomeScreen(
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background
     ) { innerPadding ->
-        LazyColumn(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .widthIn(max = 960.dp),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .widthIn(max = 960.dp)
+                    .align(Alignment.TopCenter),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
             // 1. Header with App Logo, Name, Tagline
             item {
                 Row(
@@ -446,6 +453,40 @@ fun HomeScreen(
                         onRename = { renameTarget = item },
                         onDelete = { onDeleteDrawing(item.id) }
                     )
+                }
+            }
+        }
+
+            if (isBusy) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0x99080C12)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        tonalElevation = 6.dp,
+                        modifier = Modifier
+                            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 18.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 3.dp)
+                            Column {
+                                Text("Opening CAD Drawing...", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "Decoding geometry & spatial index",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

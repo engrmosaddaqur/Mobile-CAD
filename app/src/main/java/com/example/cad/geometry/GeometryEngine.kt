@@ -281,10 +281,39 @@ object GeometryEngine {
         entities: List<CadEntity>,
         toleranceWorld: Double,
         blocks: Map<String, CadBlockDefinition> = emptyMap(),
-        visibleLayerNames: Set<String>? = null
+        visibleLayerNames: Set<String>? = null,
+        spatialIndex: CadSpatialIndex? = null
     ): CadEntity? {
         var best: CadEntity? = null
         var bestDist = toleranceWorld
+
+        if (spatialIndex != null && spatialIndex.entityCount == entities.size) {
+            val box = Bounds2D(
+                worldPoint.x - toleranceWorld,
+                worldPoint.y - toleranceWorld,
+                worldPoint.x + toleranceWorld,
+                worldPoint.y + toleranceWorld
+            )
+            val candidates = IntArrayList(64)
+            val stamp = spatialIndex.newStampBuffer()
+            spatialIndex.queryBounds(box, candidates, stamp, 1)
+            // Iterate descending index order so top-most entity wins on ties
+            val arr = candidates.data
+            var bestIdx = -1
+            for (k in 0 until candidates.size) {
+                val idx = arr[k]
+                val entity = entities[idx]
+                if (visibleLayerNames != null && entity.layerName !in visibleLayerNames) continue
+                val d = distanceToEntity(worldPoint, entity, blocks)
+                if (d < bestDist || (d == bestDist && idx > bestIdx)) {
+                    bestDist = d
+                    best = entity
+                    bestIdx = idx
+                }
+            }
+            return best
+        }
+
         for (entity in entities.asReversed()) {
             if (visibleLayerNames != null && entity.layerName !in visibleLayerNames) continue
             val d = distanceToEntity(worldPoint, entity, blocks)
@@ -301,7 +330,8 @@ object GeometryEngine {
         end: Vec2,
         entities: List<CadEntity>,
         blocks: Map<String, CadBlockDefinition> = emptyMap(),
-        visibleLayerNames: Set<String>
+        visibleLayerNames: Set<String>,
+        spatialIndex: CadSpatialIndex? = null
     ): Set<String> {
         val rect = Bounds2D(
             min(start.x, end.x),
@@ -310,6 +340,27 @@ object GeometryEngine {
             max(start.y, end.y)
         )
         val isWindowSelection = end.x >= start.x // Left-to-Right = Window (strictly inside), Right-to-Left = Crossing
+
+        if (spatialIndex != null && spatialIndex.entityCount == entities.size) {
+            val candidates = IntArrayList(256)
+            val stamp = spatialIndex.newStampBuffer()
+            spatialIndex.queryBounds(rect, candidates, stamp, 1)
+            val out = HashSet<String>(min(candidates.size, 256) + 16)
+            for (k in 0 until candidates.size) {
+                val idx = candidates[k]
+                val entity = entities[idx]
+                if (entity.layerName !in visibleLayerNames) continue
+                val eb = spatialIndex.boundsAt(idx)
+                val matched = if (isWindowSelection) {
+                    rect.contains(eb)
+                } else {
+                    rect.intersects(eb) && entityIntersectsRect(entity, rect, blocks)
+                }
+                if (matched) out.add(entity.id)
+            }
+            return out
+        }
+
         return entities.asSequence()
             .filter { it.layerName in visibleLayerNames }
             .filter { entity ->

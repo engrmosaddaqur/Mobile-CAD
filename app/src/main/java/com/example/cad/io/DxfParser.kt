@@ -18,10 +18,55 @@ import kotlin.math.PI
 
 object DxfParser {
 
+    private val MTEXT_BRACE_REGEX = Regex("\\{[^}]*;|\\}")
+
+    /** Reusable zero-Pair-allocation property buffer for each DXF record */
+    private class PropBag {
+        var codes = IntArray(64)
+        var values = ArrayList<String>(64)
+        var size = 0
+
+        fun clear() {
+            size = 0
+            values.clear()
+        }
+
+        fun add(code: Int, value: String) {
+            if (size >= codes.size) {
+                codes = codes.copyOf(codes.size * 2)
+            }
+            codes[size] = code
+            values.add(value)
+            size++
+        }
+
+        fun find(code: Int): String? {
+            for (i in 0 until size) {
+                if (codes[i] == code) return values[i]
+            }
+            return null
+        }
+
+        fun has(code: Int): Boolean {
+            for (i in 0 until size) {
+                if (codes[i] == code) return true
+            }
+            return false
+        }
+
+        fun d(code: Int, default: Double = 0.0): Double =
+            find(code)?.trim()?.toDoubleOrNull() ?: default
+
+        fun s(code: Int, default: String = ""): String =
+            find(code)?.trim() ?: default
+
+        fun i(code: Int, default: Int = 0): Int =
+            find(code)?.trim()?.toIntOrNull() ?: default
+    }
+
     fun parse(inputStream: InputStream, drawingName: String, sourceUri: String? = null): CadDocument {
-        val reader = BufferedReader(InputStreamReader(inputStream))
+        val reader = BufferedReader(InputStreamReader(inputStream), 65536)
         var section = ""
-        var inTables = false
         var currentTable = ""
         var currentBlockName: String? = null
         var currentBlockBase = Vec2.ZERO
@@ -38,32 +83,51 @@ object DxfParser {
         var polylineLayer = "0"
         var polylineClosed = false
         var polylineColor: Int? = null
+        var firstLine = true
 
-        fun readPair(): Pair<Int, String>? {
-            val codeLine = reader.readLine() ?: return null
-            val valLine = reader.readLine() ?: return null
-            val code = codeLine.trim().toIntOrNull() ?: return null
-            return code to valLine.trimEnd('\r', '\n')
+        var curCode = 0
+        var curValue = ""
+        val bag = PropBag()
+
+        fun readNextPair(): Boolean {
+            var codeLine = reader.readLine() ?: return false
+            if (firstLine) {
+                firstLine = false
+                if (codeLine.isNotEmpty() && codeLine[0] == '\uFEFF') {
+                    codeLine = codeLine.substring(1)
+                }
+            }
+            val valLine = reader.readLine() ?: return false
+            val parsedCode = codeLine.trim().toIntOrNull() ?: return false
+            curCode = parsedCode
+            curValue = valLine.trimEnd('\r', '\n')
+            return true
         }
 
-        // Collect all pairs per entity after seeing group code 0
-        var pendingPair: Pair<Int, String>? = readPair()
-        while (pendingPair != null) {
-            val (code, value) = pendingPair
+        fun collectEntityPropsIntoBag(): Boolean {
+            bag.clear()
+            while (true) {
+                if (!readNextPair()) return false
+                if (curCode == 0) return true
+                bag.add(curCode, curValue)
+            }
+        }
+
+        var hasPending = readNextPair()
+        while (hasPending) {
+            val code = curCode
+            val value = curValue
             if (code == 0 && value.trim().equals("EOF", ignoreCase = true)) break
 
             if (code == 0 && value.trim().equals("SECTION", ignoreCase = true)) {
-                val next = readPair()
-                section = if (next?.first == 2) next.second.trim().uppercase() else ""
-                inTables = (section == "TABLES")
-                pendingPair = readPair()
+                section = if (readNextPair() && curCode == 2) curValue.trim().uppercase() else ""
+                hasPending = readNextPair()
                 continue
             }
             if (code == 0 && value.trim().equals("ENDSEC", ignoreCase = true)) {
                 section = ""
-                inTables = false
                 currentTable = ""
-                pendingPair = readPair()
+                hasPending = readNextPair()
                 continue
             }
 
@@ -74,45 +138,30 @@ object DxfParser {
                     } else if (headerVar == "\$INSUNITS" && code == 70) {
                         units = CadUnits.fromDxfCode(value.trim().toIntOrNull() ?: 4)
                     }
-                    pendingPair = readPair()
+                    hasPending = readNextPair()
                 }
 
                 "TABLES" -> {
                     if (code == 0 && value.trim().equals("TABLE", ignoreCase = true)) {
-                        val next = readPair()
-                        currentTable = if (next?.first == 2) next.second.trim().uppercase() else ""
-                        pendingPair = readPair()
+                        currentTable = if (readNextPair() && curCode == 2) curValue.trim().uppercase() else ""
+                        hasPending = readNextPair()
                     } else if (code == 0 && value.trim().equals("ENDTAB", ignoreCase = true)) {
                         currentTable = ""
-                        pendingPair = readPair()
+                        hasPending = readNextPair()
                     } else if (code == 0 && value.trim().equals("LAYER", ignoreCase = true) && currentTable == "LAYER") {
-                        val props = mutableListOf<Pair<Int, String>>()
-                        var p = readPair()
-                        while (p != null && p.first != 0) {
-                            props.add(p)
-                            p = readPair()
-                        }
-                        parseLayer(props)?.let { layers[it.name] = it }
-                        pendingPair = p
+                        hasPending = collectEntityPropsIntoBag()
+                        parseLayer(bag)?.let { layers[it.name] = it }
                     } else {
-                        pendingPair = readPair()
+                        hasPending = readNextPair()
                     }
                 }
 
                 "BLOCKS" -> {
                     if (code == 0 && value.trim().equals("BLOCK", ignoreCase = true)) {
-                        val props = mutableListOf<Pair<Int, String>>()
-                        var p = readPair()
-                        while (p != null && p.first != 0) {
-                            props.add(p)
-                            p = readPair()
-                        }
-                        currentBlockName = props.firstOrNull { it.first == 2 }?.second?.trim()
-                        val bx = props.firstOrNull { it.first == 10 }?.second?.trim()?.toDoubleOrNull() ?: 0.0
-                        val by = props.firstOrNull { it.first == 20 }?.second?.trim()?.toDoubleOrNull() ?: 0.0
-                        currentBlockBase = Vec2(bx, by)
+                        hasPending = collectEntityPropsIntoBag()
+                        currentBlockName = bag.find(2)?.trim()
+                        currentBlockBase = Vec2(bag.d(10), bag.d(20))
                         blockEntities.clear()
-                        pendingPair = p
                     } else if (code == 0 && value.trim().equals("ENDBLK", ignoreCase = true)) {
                         currentBlockName?.let { bName ->
                             if (!bName.startsWith("*")) {
@@ -121,45 +170,31 @@ object DxfParser {
                         }
                         currentBlockName = null
                         blockEntities.clear()
-                        pendingPair = readPair()
+                        hasPending = readNextPair()
                     } else if (code == 0 && currentBlockName != null) {
                         val entityType = value.trim().uppercase()
-                        val props = mutableListOf<Pair<Int, String>>()
-                        var p = readPair()
-                        while (p != null && p.first != 0) {
-                            props.add(p)
-                            p = readPair()
-                        }
-                        val parsed = parseEntity(entityType, props, unsupportedCounts)
+                        hasPending = collectEntityPropsIntoBag()
+                        val parsed = parseEntity(entityType, bag, unsupportedCounts)
                         if (parsed != null) blockEntities.add(parsed)
-                        pendingPair = p
                     } else {
-                        pendingPair = readPair()
+                        hasPending = readNextPair()
                     }
                 }
 
                 "ENTITIES" -> {
                     if (code == 0) {
                         val entityType = value.trim().uppercase()
-                        val props = mutableListOf<Pair<Int, String>>()
-                        var p = readPair()
-                        while (p != null && p.first != 0) {
-                            props.add(p)
-                            p = readPair()
-                        }
+                        hasPending = collectEntityPropsIntoBag()
                         when (entityType) {
                             "POLYLINE" -> {
                                 polylineInProgress = mutableListOf()
-                                polylineLayer = props.firstOrNull { it.first == 8 }?.second?.trim().orEmpty().ifEmpty { "0" }
-                                val flags = props.firstOrNull { it.first == 70 }?.second?.trim()?.toIntOrNull() ?: 0
-                                polylineClosed = (flags and 1) != 0
-                                val aci = props.firstOrNull { it.first == 62 }?.second?.trim()?.toIntOrNull()
+                                polylineLayer = bag.s(8, "0").ifEmpty { "0" }
+                                polylineClosed = (bag.i(70) and 1) != 0
+                                val aci = bag.find(62)?.trim()?.toIntOrNull()
                                 polylineColor = aci?.let { if (it in 1..255) AciColors.toArgb(it) else null }
                             }
                             "VERTEX" -> {
-                                val vx = props.firstOrNull { it.first == 10 }?.second?.trim()?.toDoubleOrNull() ?: 0.0
-                                val vy = props.firstOrNull { it.first == 20 }?.second?.trim()?.toDoubleOrNull() ?: 0.0
-                                polylineInProgress?.add(Vec2(vx, vy))
+                                polylineInProgress?.add(Vec2(bag.d(10), bag.d(20)))
                             }
                             "SEQEND" -> {
                                 polylineInProgress?.let { pts ->
@@ -177,18 +212,17 @@ object DxfParser {
                                 polylineInProgress = null
                             }
                             else -> {
-                                val parsed = parseEntity(entityType, props, unsupportedCounts)
+                                val parsed = parseEntity(entityType, bag, unsupportedCounts)
                                 if (parsed != null) entities.add(parsed)
                             }
                         }
-                        pendingPair = p
                     } else {
-                        pendingPair = readPair()
+                        hasPending = readNextPair()
                     }
                 }
 
                 else -> {
-                    pendingPair = readPair()
+                    hasPending = readNextPair()
                 }
             }
         }
@@ -222,15 +256,15 @@ object DxfParser {
         )
     }
 
-    private fun parseLayer(props: List<Pair<Int, String>>): CadLayer? {
-        val name = props.firstOrNull { it.first == 2 }?.second?.trim().orEmpty()
+    private fun parseLayer(bag: PropBag): CadLayer? {
+        val name = bag.s(2)
         if (name.isEmpty()) return null
-        val flags = props.firstOrNull { it.first == 70 }?.second?.trim()?.toIntOrNull() ?: 0
-        val rawColor = props.firstOrNull { it.first == 62 }?.second?.trim()?.toIntOrNull() ?: 7
+        val flags = bag.i(70, 0)
+        val rawColor = bag.i(62, 7)
         val isOn = rawColor >= 0
         val aci = kotlin.math.abs(rawColor).coerceIn(1, 255)
-        val ltypeName = props.firstOrNull { it.first == 6 }?.second?.trim() ?: "CONTINUOUS"
-        val lwRaw = props.firstOrNull { it.first == 370 }?.second?.trim()?.toIntOrNull() ?: 25
+        val ltypeName = bag.s(6, "CONTINUOUS").ifEmpty { "CONTINUOUS" }
+        val lwRaw = bag.i(370, 25)
         val lwMm = if (lwRaw > 0) lwRaw / 100f else 0.25f
 
         return CadLayer(
@@ -247,40 +281,32 @@ object DxfParser {
 
     private fun parseEntity(
         type: String,
-        props: List<Pair<Int, String>>,
+        bag: PropBag,
         unsupportedCounts: MutableMap<String, Int>
     ): CadEntity? {
-        val layer = props.firstOrNull { it.first == 8 }?.second?.trim().orEmpty().ifEmpty { "0" }
-        val aci = props.firstOrNull { it.first == 62 }?.second?.trim()?.toIntOrNull()
+        val layer = bag.s(8, "0").ifEmpty { "0" }
+        val aci = bag.find(62)?.trim()?.toIntOrNull()
         val colorArgb = if (aci != null && aci in 1..255) AciColors.toArgb(aci) else null
-        val ltypeStr = props.firstOrNull { it.first == 6 }?.second?.trim()
+        val ltypeStr = bag.find(6)?.trim()
         val lineType = ltypeStr?.let { CadLineType.fromDxfName(it) }
-        val lwRaw = props.firstOrNull { it.first == 370 }?.second?.trim()?.toIntOrNull()
+        val lwRaw = bag.find(370)?.trim()?.toIntOrNull()
         val lineWeight = if (lwRaw != null && lwRaw > 0) lwRaw / 100f else null
-
-        fun d(code: Int, default: Double = 0.0): Double =
-            props.firstOrNull { it.first == code }?.second?.trim()?.toDoubleOrNull() ?: default
-
-        fun s(code: Int, default: String = ""): String =
-            props.firstOrNull { it.first == code }?.second?.trim() ?: default
-
-        fun i(code: Int, default: Int = 0): Int =
-            props.firstOrNull { it.first == code }?.second?.trim()?.toIntOrNull() ?: default
 
         return when (type) {
             "LINE" -> CadLine(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
-                start = Vec2(d(10), d(20)),
-                end = Vec2(d(11), d(21))
+                start = Vec2(bag.d(10), bag.d(20)),
+                end = Vec2(bag.d(11), bag.d(21))
             )
 
             "LWPOLYLINE" -> {
-                val pts = mutableListOf<Vec2>()
+                val pts = ArrayList<Vec2>(maxOf(4, bag.size / 2))
                 var pendingX: Double? = null
-                for ((c, v) in props) {
-                    if (c == 10) pendingX = v.trim().toDoubleOrNull()
+                for (idx in 0 until bag.size) {
+                    val c = bag.codes[idx]
+                    if (c == 10) pendingX = bag.values[idx].trim().toDoubleOrNull()
                     else if (c == 20 && pendingX != null) {
-                        val y = v.trim().toDoubleOrNull() ?: 0.0
+                        val y = bag.values[idx].trim().toDoubleOrNull() ?: 0.0
                         pts.add(Vec2(pendingX, y))
                         pendingX = null
                     }
@@ -289,40 +315,41 @@ object DxfParser {
                 CadPolyline(
                     layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
                     points = pts,
-                    isClosed = (i(70) and 1) != 0
+                    isClosed = (bag.i(70) and 1) != 0
                 )
             }
 
             "CIRCLE" -> CadCircle(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
-                center = Vec2(d(10), d(20)),
-                radius = d(40, 10.0).coerceAtLeast(1e-4)
+                center = Vec2(bag.d(10), bag.d(20)),
+                radius = bag.d(40, 10.0).coerceAtLeast(1e-4)
             )
 
             "ARC" -> CadArc(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
-                center = Vec2(d(10), d(20)),
-                radius = d(40, 10.0).coerceAtLeast(1e-4),
-                startAngleDeg = d(50, 0.0),
-                endAngleDeg = d(51, 90.0)
+                center = Vec2(bag.d(10), bag.d(20)),
+                radius = bag.d(40, 10.0).coerceAtLeast(1e-4),
+                startAngleDeg = bag.d(50, 0.0),
+                endAngleDeg = bag.d(51, 90.0)
             )
 
             "ELLIPSE" -> CadEllipse(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
-                center = Vec2(d(10), d(20)),
-                majorAxisEndOffset = Vec2(d(11, 10.0), d(21, 0.0)),
-                minorToMajorRatio = d(40, 0.5).coerceIn(0.05, 1.0),
-                startParamRad = d(41, 0.0),
-                endParamRad = d(42, 2.0 * PI)
+                center = Vec2(bag.d(10), bag.d(20)),
+                majorAxisEndOffset = Vec2(bag.d(11, 10.0), bag.d(21, 0.0)),
+                minorToMajorRatio = bag.d(40, 0.5).coerceIn(0.05, 1.0),
+                startParamRad = bag.d(41, 0.0),
+                endParamRad = bag.d(42, 2.0 * PI)
             )
 
             "SPLINE" -> {
-                val ctrlPts = mutableListOf<Vec2>()
+                val ctrlPts = ArrayList<Vec2>(maxOf(4, bag.size / 3))
                 var pendingX: Double? = null
-                for ((c, v) in props) {
-                    if (c == 10) pendingX = v.trim().toDoubleOrNull()
+                for (idx in 0 until bag.size) {
+                    val c = bag.codes[idx]
+                    if (c == 10) pendingX = bag.values[idx].trim().toDoubleOrNull()
                     else if (c == 20 && pendingX != null) {
-                        ctrlPts.add(Vec2(pendingX, v.trim().toDoubleOrNull() ?: 0.0))
+                        ctrlPts.add(Vec2(pendingX, bag.values[idx].trim().toDoubleOrNull() ?: 0.0))
                         pendingX = null
                     }
                 }
@@ -330,55 +357,55 @@ object DxfParser {
                 CadSpline(
                     layerName = layer, colorArgb = colorArgb, lineType = lineType, lineWeightMm = lineWeight,
                     controlPoints = ctrlPts,
-                    degree = i(71, 3),
-                    isClosed = (i(70) and 1) != 0
+                    degree = bag.i(71, 3),
+                    isClosed = (bag.i(70) and 1) != 0
                 )
             }
 
             "POINT" -> CadPoint(
                 layerName = layer, colorArgb = colorArgb,
-                position = Vec2(d(10), d(20))
+                position = Vec2(bag.d(10), bag.d(20))
             )
 
             "RAY" -> CadRay(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType,
-                origin = Vec2(d(10), d(20)),
-                direction = Vec2(d(11, 1.0), d(21, 0.0))
+                origin = Vec2(bag.d(10), bag.d(20)),
+                direction = Vec2(bag.d(11, 1.0), bag.d(21, 0.0))
             )
 
             "XLINE" -> CadXLine(
                 layerName = layer, colorArgb = colorArgb, lineType = lineType,
-                origin = Vec2(d(10), d(20)),
-                direction = Vec2(d(11, 1.0), d(21, 0.0))
+                origin = Vec2(bag.d(10), bag.d(20)),
+                direction = Vec2(bag.d(11, 1.0), bag.d(21, 0.0))
             )
 
             "TEXT", "MTEXT" -> {
-                val rawText = s(1, "").replace("\\P", "\n").replace(Regex("\\{[^}]*;|\\}"), "")
+                val rawText = bag.s(1, "").replace("\\P", "\n").replace(MTEXT_BRACE_REGEX, "")
                 if (rawText.isEmpty()) return null
                 CadText(
                     layerName = layer, colorArgb = colorArgb,
-                    position = Vec2(d(10), d(20)),
+                    position = Vec2(bag.d(10), bag.d(20)),
                     text = rawText,
-                    height = d(40, 4.0).coerceAtLeast(0.5),
-                    rotationDeg = d(50, 0.0)
+                    height = bag.d(40, 4.0).coerceAtLeast(0.5),
+                    rotationDeg = bag.d(50, 0.0)
                 )
             }
 
             "INSERT" -> {
-                val bName = s(2, "")
+                val bName = bag.s(2, "")
                 if (bName.isEmpty()) return null
                 CadBlockReference(
                     layerName = layer, colorArgb = colorArgb,
                     blockName = bName,
-                    insertionPoint = Vec2(d(10), d(20)),
-                    scaleX = d(41, 1.0),
-                    scaleY = d(42, 1.0),
-                    rotationDeg = d(50, 0.0)
+                    insertionPoint = Vec2(bag.d(10), bag.d(20)),
+                    scaleX = bag.d(41, 1.0),
+                    scaleY = bag.d(42, 1.0),
+                    rotationDeg = bag.d(50, 0.0)
                 )
             }
 
             "DIMENSION" -> {
-                val dimFlags = i(70, 0) and 0x0F
+                val dimFlags = bag.i(70, 0) and 0x0F
                 val dimType = when (dimFlags) {
                     1 -> DimensionType.ALIGNED
                     2, 5 -> DimensionType.ANGULAR
@@ -386,10 +413,10 @@ object DxfParser {
                     4 -> DimensionType.RADIUS
                     else -> DimensionType.LINEAR
                 }
-                val defPt = Vec2(d(10), d(20))
-                val p1 = if (props.any { it.first == 13 }) Vec2(d(13), d(23)) else defPt
-                val p2 = if (props.any { it.first == 14 }) Vec2(d(14), d(24)) else Vec2(d(11), d(21))
-                val override = s(1, "").takeIf { it.isNotEmpty() && it != "<>" }
+                val defPt = Vec2(bag.d(10), bag.d(20))
+                val p1 = if (bag.has(13)) Vec2(bag.d(13), bag.d(23)) else defPt
+                val p2 = if (bag.has(14)) Vec2(bag.d(14), bag.d(24)) else Vec2(bag.d(11), bag.d(21))
+                val override = bag.s(1, "").takeIf { it.isNotEmpty() && it != "<>" }
                 CadDimension(
                     layerName = layer, colorArgb = colorArgb,
                     dimType = dimType,
@@ -402,10 +429,10 @@ object DxfParser {
 
             "SOLID", "3DFACE" -> {
                 val pts = listOf(
-                    Vec2(d(10), d(20)),
-                    Vec2(d(11), d(21)),
-                    Vec2(d(12), d(22)),
-                    Vec2(d(13, d(12)), d(23, d(22)))
+                    Vec2(bag.d(10), bag.d(20)),
+                    Vec2(bag.d(11), bag.d(21)),
+                    Vec2(bag.d(12), bag.d(22)),
+                    Vec2(bag.d(13, bag.d(12)), bag.d(23, bag.d(22)))
                 )
                 CadPolyline(layerName = layer, colorArgb = colorArgb, points = pts, isClosed = true)
             }

@@ -36,6 +36,9 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val _importError = MutableStateFlow<Pair<String, String>?>(null)
     val importError: StateFlow<Pair<String, String>?> = _importError.asStateFlow()
 
+    private val _isBusy = MutableStateFlow(false)
+    val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
+
     init {
         viewModelScope.launch {
             fileRepo.seedInitialSamplesIfEmpty()
@@ -63,21 +66,31 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         onCreated: (String) -> Unit
     ) {
         viewModelScope.launch {
-            val doc = SampleDrawings.blankDrawing(
-                name = name.trim().ifEmpty { "Drawing_${System.currentTimeMillis() % 1000}" },
-                projectGroup = projectGroup.trim().ifEmpty { "Default Project" },
-                units = units
-            )
-            val saved = fileRepo.saveDrawingInternal(doc, clearRecovery = true)
-            onCreated(saved.id)
+            _isBusy.value = true
+            try {
+                val doc = SampleDrawings.blankDrawing(
+                    name = name.trim().ifEmpty { "Drawing_${System.currentTimeMillis() % 1000}" },
+                    projectGroup = projectGroup.trim().ifEmpty { "Default Project" },
+                    units = units
+                )
+                val saved = fileRepo.saveDrawingInternal(doc, clearRecovery = true)
+                onCreated(saved.id)
+            } finally {
+                _isBusy.value = false
+            }
         }
     }
 
     fun importFile(uri: Uri, onImported: (String) -> Unit) {
         viewModelScope.launch {
-            when (val res = fileRepo.importFromUri(uri)) {
-                is CadImportOutcome.Success -> onImported(res.document.id)
-                is CadImportOutcome.Error -> _importError.value = res.title to res.message
+            _isBusy.value = true
+            try {
+                when (val res = fileRepo.importFromUri(uri)) {
+                    is CadImportOutcome.Success -> onImported(res.document.id)
+                    is CadImportOutcome.Error -> _importError.value = res.title to res.message
+                }
+            } finally {
+                _isBusy.value = false
             }
         }
     }

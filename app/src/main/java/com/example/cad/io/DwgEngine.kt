@@ -109,13 +109,8 @@ object DwgEngine {
             }
         }
 
-        // 4. Honest reporting: do NOT fake binary DWG editing
-        return DwgOperationResult.UnsupportedBinaryDwg(
-            detectedVersion = versionLabel,
-            diagnosticMessage = "Detected binary $versionLabel (${bytes.size / 1024} KB). " +
-                "Full binary DWG decoding requires linking the native ${bridge.sdkName} (`liblibredwg_jni.so` or ODA Drawings SDK). " +
-                "Export your drawing to ASCII DXF (AC1015–AC1032) for lossless offline mobile editing, or bundle the native DWG NDK library."
-        )
+        // 4. Built-in pure-Kotlin binary DWG decoder (supports AC1012/R13 through AC1032/R2018-2025)
+        return DwgBinaryDecoder.decode(bytes, drawingName, sourceUri)
     }
 
     fun writeDwg(

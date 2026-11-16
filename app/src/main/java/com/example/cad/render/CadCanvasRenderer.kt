@@ -13,8 +13,10 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import com.example.cad.geometry.CadSpatialIndex
 import com.example.cad.geometry.GeometryEngine
 import com.example.cad.geometry.GeometryOperations
+import com.example.cad.geometry.IntArrayList
 import com.example.cad.geometry.SnapResult
 import com.example.cad.io.CadExportEngine
 import com.example.cad.model.Bounds2D
@@ -28,6 +30,7 @@ import com.example.cad.model.DimensionType
 import com.example.cad.model.OsnapType
 import com.example.cad.model.SnapSettings
 import com.example.cad.model.Vec2
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
@@ -52,6 +55,28 @@ object CadCanvasRenderer {
         isSubpixelText = true
     }
 
+    private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    // Pre-allocated scratch buffers reused across frames to eliminate GC churn at 60fps
+    private val scratchPath = Path()
+    private val scratchVisibleIndices = IntArrayList(1024)
+    private var scratchStamp = IntArray(1024)
+    private var scratchStampSeq = 1
+
+    private val previewDashEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 6f), 0f)
+    private val selectedDashEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 6f), 0f)
+    private val crossingDashEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+    private val trackingDashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+
+    private val lineTypeDashCache: Map<CadLineType, PathEffect?> = mapOf(
+        CadLineType.CONTINUOUS to null,
+        CadLineType.DASHED to PathEffect.dashPathEffect(CadLineType.DASHED.dashPatternPx!!, 0f),
+        CadLineType.DOTTED to PathEffect.dashPathEffect(CadLineType.DOTTED.dashPatternPx!!, 0f),
+        CadLineType.DASHDOT to PathEffect.dashPathEffect(CadLineType.DASHDOT.dashPatternPx!!, 0f),
+        CadLineType.CENTER to PathEffect.dashPathEffect(CadLineType.CENTER.dashPatternPx!!, 0f),
+        CadLineType.HIDDEN to PathEffect.dashPathEffect(CadLineType.HIDDEN.dashPatternPx!!, 0f)
+    )
+
     fun DrawScope.renderScene(
         doc: CadDocument,
         viewport: ViewportState,
@@ -60,6 +85,7 @@ object CadCanvasRenderer {
         cursorWorld: Vec2?,
         snapResult: SnapResult?,
         preview: PreviewGeometry,
+        spatialIndex: CadSpatialIndex? = null,
         crosshairSizeRatio: Float = 0.06f
     ) {
         val bgColor = Color(bgTheme.backgroundArgb)
@@ -81,46 +107,102 @@ object CadCanvasRenderer {
         // 3. X & Y World Axes + UCS Triad
         drawAxesAndUcs(viewport, bgTheme.isDarkCanvas)
 
-        // 4. Entities (frustum culled for high performance on large drawings)
-        val layerMap = doc.layers.associateBy { it.name.uppercase() }
-        val expandedBounds = visibleBounds.expand(max(visibleBounds.width, visibleBounds.height) * 0.1)
+        // 4. Entities (spatial-index O(k) frustum culled + adaptive LOD for 60fps on massive DWGs/DXFs)
+        val exactLayerMap = HashMap<String, CadLayer>(doc.layers.size * 2)
+        val upperLayerMap = HashMap<String, CadLayer>(doc.layers.size * 2)
+        for (layer in doc.layers) {
+            exactLayerMap[layer.name] = layer
+            upperLayerMap[layer.name.uppercase()] = layer
+        }
+        val expandedBounds = visibleBounds.expand(max(visibleBounds.width, visibleBounds.height) * 0.08)
 
-        for (entity in doc.entities) {
-            val layer = layerMap[entity.layerName.uppercase()]
-            if (layer != null && (!layer.isOn || layer.isFrozen)) continue
+        val entities = doc.entities
+        val useIndex = spatialIndex != null && spatialIndex.entityCount == entities.size
 
-            // Fast frustum culling for bounded entities
-            if (entity !is CadRay && entity !is CadXLine) {
-                val eb = GeometryEngine.boundsOf(entity, doc.blocks)
-                if (!expandedBounds.intersects(eb)) continue
+        if (useIndex) {
+            val idx = spatialIndex!!
+            if (scratchStamp.size < entities.size) {
+                scratchStamp = IntArray(entities.size + 256)
+            }
+            scratchStampSeq++
+            if (scratchStampSeq == Int.MAX_VALUE) {
+                scratchStamp.fill(0)
+                scratchStampSeq = 1
             }
 
-            drawCadEntity(entity, doc, layer, viewport, bgTheme.isDarkCanvas, isPreview = false)
-        }
+            idx.queryBounds(expandedBounds, scratchVisibleIndices, scratchStamp, scratchStampSeq)
+            val visCount = scratchVisibleIndices.size
+            val disableDashesForSpeed = visCount > 2500
+            val zoom = viewport.zoom
 
-        // 5. Object Grips for selected entities
-        for (entity in doc.entities) {
-            if (!entity.isSelected) continue
-            val grips = GeometryOperations.gripsOf(entity)
-            for (g in grips) {
-                val sp = viewport.worldToScreen(g)
-                drawRect(
-                    color = Color(0xFF00E5FF),
-                    topLeft = Offset(sp.x - 6f, sp.y - 6f),
-                    size = Size(12f, 12f)
+            for (k in 0 until visCount) {
+                val eIdx = scratchVisibleIndices[k]
+                val entity = entities[eIdx]
+                val layer = exactLayerMap[entity.layerName] ?: upperLayerMap[entity.layerName.uppercase()]
+                if (layer != null && (!layer.isOn || layer.isFrozen)) continue
+
+                val eb = idx.boundsAt(eIdx)
+                val pxW = eb.width * zoom
+                val pxH = eb.height * zoom
+                val maxDimPx = max(pxW, pxH)
+
+                // Sub-pixel LOD culling when zoomed far out on dense 50k+ entity drawings
+                if (!entity.isSelected && entity !is CadRay && entity !is CadXLine) {
+                    if (maxDimPx < 0.35 && visCount > 300) continue
+                    if (maxDimPx < 1.1 && visCount > 600) {
+                        val sp = viewport.worldToScreen(eb.center)
+                        val baseArgb = entity.colorArgb ?: layer?.colorArgb ?: 0xFFFFFFFF.toInt()
+                        val col = if (!bgTheme.isDarkCanvas && (baseArgb and 0xFFFFFF) == 0xFFFFFF) {
+                            Color(0xFF101923)
+                        } else Color(baseArgb)
+                        drawLine(col, sp, Offset(sp.x + 1.5f, sp.y + 1.5f), strokeWidth = 1.4f)
+                        continue
+                    }
+                }
+
+                drawCadEntity(
+                    entity = entity,
+                    doc = doc,
+                    layer = layer,
+                    viewport = viewport,
+                    isDarkCanvas = bgTheme.isDarkCanvas,
+                    isPreview = false,
+                    spatialIndex = idx,
+                    screenExtentPx = maxDimPx,
+                    suppressDashing = disableDashesForSpeed
                 )
-                drawRect(
-                    color = Color(0xFF080C12),
-                    topLeft = Offset(sp.x - 6f, sp.y - 6f),
-                    size = Size(12f, 12f),
-                    style = Stroke(width = 1.8f)
-                )
+            }
+
+            // 5. Object Grips for selected entities (O(selected) instead of scanning all entities)
+            for (selIdx in idx.selectedIndices) {
+                val entity = entities[selIdx]
+                if (!entity.isSelected) continue
+                drawEntityGrips(entity, viewport)
+            }
+        } else {
+            val visApprox = entities.size
+            val disableDashesForSpeed = visApprox > 2500
+            for (entity in entities) {
+                val layer = exactLayerMap[entity.layerName] ?: upperLayerMap[entity.layerName.uppercase()]
+                if (layer != null && (!layer.isOn || layer.isFrozen)) continue
+
+                if (entity !is CadRay && entity !is CadXLine) {
+                    val eb = GeometryEngine.boundsOf(entity, doc.blocks)
+                    if (!expandedBounds.intersects(eb)) continue
+                    val maxDimPx = max(eb.width, eb.height) * viewport.zoom
+                    drawCadEntity(entity, doc, layer, viewport, bgTheme.isDarkCanvas, isPreview = false, spatialIndex = null, screenExtentPx = maxDimPx, suppressDashing = disableDashesForSpeed)
+                } else {
+                    drawCadEntity(entity, doc, layer, viewport, bgTheme.isDarkCanvas, isPreview = false, spatialIndex = null, screenExtentPx = 500.0, suppressDashing = disableDashesForSpeed)
+                }
+            }
+            for (entity in entities) {
+                if (entity.isSelected) drawEntityGrips(entity, viewport)
             }
         }
 
         // 6. Preview Entities (rubber-band)
         for (pEntity in preview.entities) {
-            drawCadEntity(pEntity, doc, null, viewport, bgTheme.isDarkCanvas, isPreview = true)
+            drawCadEntity(pEntity, doc, null, viewport, bgTheme.isDarkCanvas, isPreview = true, spatialIndex = null, screenExtentPx = 500.0, suppressDashing = false)
         }
 
         // 7. Window / Crossing Selection Rectangle
@@ -144,7 +226,7 @@ object CadCanvasRenderer {
                 size = Size(w, h),
                 style = Stroke(
                     width = 2.2f,
-                    pathEffect = if (isWindow) null else PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+                    pathEffect = if (isWindow) null else crossingDashEffect
                 )
             )
         }
@@ -158,7 +240,7 @@ object CadCanvasRenderer {
                 start = sa,
                 end = sb,
                 strokeWidth = 1.6f,
-                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                pathEffect = trackingDashEffect
             )
         }
 
@@ -190,6 +272,24 @@ object CadCanvasRenderer {
                 screenPos = Offset(sp.x + 16f, sp.y - 24f),
                 bgColor = 0xDD131B26.toInt(),
                 textColor = 0xFF00E5FF.toInt()
+            )
+        }
+    }
+
+    private fun DrawScope.drawEntityGrips(entity: CadEntity, viewport: ViewportState) {
+        val grips = GeometryOperations.gripsOf(entity)
+        for (g in grips) {
+            val sp = viewport.worldToScreen(g)
+            drawRect(
+                color = Color(0xFF00E5FF),
+                topLeft = Offset(sp.x - 6f, sp.y - 6f),
+                size = Size(12f, 12f)
+            )
+            drawRect(
+                color = Color(0xFF080C12),
+                topLeft = Offset(sp.x - 6f, sp.y - 6f),
+                size = Size(12f, 12f),
+                style = Stroke(width = 1.8f)
             )
         }
     }
@@ -248,7 +348,6 @@ object CadCanvasRenderer {
         isDarkCanvas: Boolean
     ) {
         val basePx = baseSpacing * viewport.zoom
-        // Scale grid step by powers of 10 or 5 so spacing stays 20px..140px
         val step = if (basePx < 16.0) {
             val factor = 10.0.pow(ceil(log10(28.0 / basePx)))
             baseSpacing * factor
@@ -262,12 +361,18 @@ object CadCanvasRenderer {
         val minorColor = if (isDarkCanvas) Color(0xFF1A2535) else Color(0xFFE1E8F0)
         val majorColor = if (isDarkCanvas) Color(0xFF26364D) else Color(0xFFC8D4E2)
 
+        val halfW = viewport.viewWidthPx * 0.5f
+        val halfH = viewport.viewHeightPx * 0.5f
+        val cx = viewport.centerWorld.x
+        val cy = viewport.centerWorld.y
+        val zoom = viewport.zoom
+
         val startX = floor(bounds.minX / step) * step
         val endX = ceil(bounds.maxX / step) * step
         var x = startX
         var count = 0
         while (x <= endX && count < 180) {
-            val sx = viewport.worldToScreen(Vec2(x, 0.0)).x
+            val sx = (halfW + (x - cx) * zoom).toFloat()
             val isMajor = abs((x / (step * 5.0)) - kotlin.math.round(x / (step * 5.0))) < 1e-4
             drawLine(
                 color = if (isMajor) majorColor else minorColor,
@@ -284,7 +389,7 @@ object CadCanvasRenderer {
         var y = startY
         count = 0
         while (y <= endY && count < 180) {
-            val sy = viewport.worldToScreen(Vec2(0.0, y)).y
+            val sy = (halfH - (y - cy) * zoom).toFloat()
             val isMajor = abs((y / (step * 5.0)) - kotlin.math.round(y / (step * 5.0))) < 1e-4
             drawLine(
                 color = if (isMajor) majorColor else minorColor,
@@ -308,7 +413,6 @@ object CadCanvasRenderer {
             drawLine(Color(0xFF00E676).copy(alpha = axisAlpha), Offset(originScreen.x, 0f), Offset(originScreen.x, size.height), strokeWidth = 1.4f)
         }
 
-        // Fixed bottom-left UCS icon
         val ucsOrigin = Offset(44f, size.height - 44f)
         drawLine(Color(0xFFFF5252), ucsOrigin, Offset(ucsOrigin.x + 28f, ucsOrigin.y), strokeWidth = 2.5f)
         drawLine(Color(0xFF00E676), ucsOrigin, Offset(ucsOrigin.x, ucsOrigin.y - 28f), strokeWidth = 2.5f)
@@ -321,7 +425,10 @@ object CadCanvasRenderer {
         layer: CadLayer?,
         viewport: ViewportState,
         isDarkCanvas: Boolean,
-        isPreview: Boolean
+        isPreview: Boolean,
+        spatialIndex: CadSpatialIndex?,
+        screenExtentPx: Double,
+        suppressDashing: Boolean
     ) {
         val baseArgb = entity.colorArgb ?: layer?.colorArgb ?: 0xFFFFFFFF.toInt()
         var color = Color(baseArgb)
@@ -329,53 +436,137 @@ object CadCanvasRenderer {
             color = Color(0xFF101923)
         }
         val alpha = if (isPreview) 0.85f else (1f - entity.transparency.coerceIn(0f, 0.9f))
-        color = if (entity.isSelected) Color(0xFF00E5FF) else color.copy(alpha = alpha)
+        color = if (entity.isSelected) Color(0xFF00E5FF) else if (alpha < 0.999f) color.copy(alpha = alpha) else color
 
         val lw = entity.lineWeightMm ?: layer?.lineWeightMm ?: 0.25f
         val strokePx = max(1.6f, lw * 5.2f) + (if (entity.isSelected) 1.6f else 0f)
         val lt = entity.lineType ?: layer?.lineType ?: CadLineType.CONTINUOUS
-        val dashEffect = if (isPreview) {
-            PathEffect.dashPathEffect(floatArrayOf(12f, 6f), 0f)
-        } else if (entity.isSelected) {
-            PathEffect.dashPathEffect(floatArrayOf(14f, 6f), 0f)
-        } else {
-            lt.dashPatternPx?.let { PathEffect.dashPathEffect(it, 0f) }
+        val dashEffect = when {
+            isPreview -> previewDashEffect
+            entity.isSelected -> selectedDashEffect
+            suppressDashing -> null
+            else -> lineTypeDashCache[lt]
         }
-        val stroke = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round, pathEffect = dashEffect)
+
+        val halfW = viewport.viewWidthPx * 0.5f
+        val halfH = viewport.viewHeightPx * 0.5f
+        val cxW = viewport.centerWorld.x
+        val cyW = viewport.centerWorld.y
+        val zoom = viewport.zoom
 
         when (entity) {
             is CadLine -> {
-                drawLine(color, viewport.worldToScreen(entity.start), viewport.worldToScreen(entity.end), strokeWidth = strokePx, cap = StrokeCap.Round, pathEffect = dashEffect)
+                val sx = (halfW + (entity.start.x - cxW) * zoom).toFloat()
+                val sy = (halfH - (entity.start.y - cyW) * zoom).toFloat()
+                val ex = (halfW + (entity.end.x - cxW) * zoom).toFloat()
+                val ey = (halfH - (entity.end.y - cyW) * zoom).toFloat()
+                drawLine(color, Offset(sx, sy), Offset(ex, ey), strokeWidth = strokePx, cap = StrokeCap.Round, pathEffect = dashEffect)
             }
             is CadPolyline -> if (entity.points.size >= 2) {
-                val path = Path()
-                val p0 = viewport.worldToScreen(entity.points[0])
-                path.moveTo(p0.x, p0.y)
-                for (i in 1 until entity.points.size) {
-                    val pi = viewport.worldToScreen(entity.points[i])
-                    path.lineTo(pi.x, pi.y)
+                scratchPath.reset()
+                val pts = entity.points
+                scratchPath.moveTo(
+                    (halfW + (pts[0].x - cxW) * zoom).toFloat(),
+                    (halfH - (pts[0].y - cyW) * zoom).toFloat()
+                )
+                // Vertex thinning LOD when a huge polyline spans very few pixels
+                val step = if (pts.size > 128 && screenExtentPx < 40.0) max(1, pts.size / 32) else 1
+                var i = step
+                while (i < pts.size) {
+                    val pi = pts[i]
+                    scratchPath.lineTo(
+                        (halfW + (pi.x - cxW) * zoom).toFloat(),
+                        (halfH - (pi.y - cyW) * zoom).toFloat()
+                    )
+                    i += step
                 }
-                if (entity.isClosed) path.close()
-                drawPath(path, color, style = stroke)
+                if (step > 1 && i - step != pts.lastIndex) {
+                    val last = pts.last()
+                    scratchPath.lineTo(
+                        (halfW + (last.x - cxW) * zoom).toFloat(),
+                        (halfH - (last.y - cyW) * zoom).toFloat()
+                    )
+                }
+                if (entity.isClosed) scratchPath.close()
+                drawPath(scratchPath, color, style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round, pathEffect = dashEffect))
             }
             is CadCircle -> {
                 val sc = viewport.worldToScreen(entity.center)
-                val rPx = (entity.radius * viewport.zoom).toFloat()
+                val rPx = (entity.radius * zoom).toFloat()
                 if (rPx > 0.5f) {
-                    drawCircle(color, radius = rPx, center = sc, style = stroke)
+                    drawCircle(color, radius = rPx, center = sc, style = Stroke(width = strokePx, pathEffect = dashEffect))
                 }
             }
             is CadArc -> {
-                val pts = GeometryEngine.sampleArcPoints(entity, 40)
-                drawPointSequence(pts, viewport, color, stroke, closed = false)
+                val rPx = entity.radius * zoom
+                if (rPx < 0.5) return
+                val segs = when {
+                    rPx < 8.0 -> 6
+                    rPx < 30.0 -> 14
+                    rPx < 120.0 -> 26
+                    else -> 40
+                }
+                val sweep = GeometryEngine.normalizeSweepDeg(entity.startAngleDeg, entity.endAngleDeg)
+                val count = max(4, (segs * sweep / 360.0).toInt().coerceAtLeast(4))
+                scratchPath.reset()
+                for (idx in 0..count) {
+                    val deg = entity.startAngleDeg + sweep * (idx.toDouble() / count)
+                    val rad = Math.toRadians(deg)
+                    val wx = entity.center.x + entity.radius * cos(rad)
+                    val wy = entity.center.y + entity.radius * sin(rad)
+                    val px = (halfW + (wx - cxW) * zoom).toFloat()
+                    val py = (halfH - (wy - cyW) * zoom).toFloat()
+                    if (idx == 0) scratchPath.moveTo(px, py) else scratchPath.lineTo(px, py)
+                }
+                drawPath(scratchPath, color, style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round, pathEffect = dashEffect))
             }
             is CadEllipse -> {
-                val pts = GeometryEngine.sampleEllipsePoints(entity, 54)
-                drawPointSequence(pts, viewport, color, stroke, closed = false)
+                val major = entity.majorAxisEndOffset
+                val majorLen = major.length()
+                if (majorLen < 1e-9) return
+                val segs = when {
+                    screenExtentPx < 10.0 -> 8
+                    screenExtentPx < 40.0 -> 18
+                    screenExtentPx < 140.0 -> 32
+                    else -> 54
+                }
+                val rotRad = major.angleRad()
+                val minorLen = majorLen * entity.minorToMajorRatio
+                val cRot = cos(rotRad)
+                val sRot = sin(rotRad)
+                var sweep = entity.endParamRad - entity.startParamRad
+                if (sweep <= 0.0) sweep += 2.0 * PI
+                scratchPath.reset()
+                for (i in 0..segs) {
+                    val t = entity.startParamRad + sweep * (i.toDouble() / segs)
+                    val lx = majorLen * cos(t)
+                    val ly = minorLen * sin(t)
+                    val wx = entity.center.x + lx * cRot - ly * sRot
+                    val wy = entity.center.y + lx * sRot + ly * cRot
+                    val px = (halfW + (wx - cxW) * zoom).toFloat()
+                    val py = (halfH - (wy - cyW) * zoom).toFloat()
+                    if (i == 0) scratchPath.moveTo(px, py) else scratchPath.lineTo(px, py)
+                }
+                drawPath(scratchPath, color, style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round, pathEffect = dashEffect))
             }
             is CadSpline -> {
-                val pts = GeometryEngine.sampleSplinePoints(entity, 12)
-                drawPointSequence(pts, viewport, color, stroke, closed = false)
+                val subdiv = if (screenExtentPx < 40.0) 4 else if (screenExtentPx < 150.0) 8 else 12
+                val pts = GeometryEngine.sampleSplinePoints(entity, subdiv)
+                if (pts.size >= 2) {
+                    scratchPath.reset()
+                    scratchPath.moveTo(
+                        (halfW + (pts[0].x - cxW) * zoom).toFloat(),
+                        (halfH - (pts[0].y - cyW) * zoom).toFloat()
+                    )
+                    for (i in 1 until pts.size) {
+                        val pi = pts[i]
+                        scratchPath.lineTo(
+                            (halfW + (pi.x - cxW) * zoom).toFloat(),
+                            (halfH - (pi.y - cyW) * zoom).toFloat()
+                        )
+                    }
+                    drawPath(scratchPath, color, style = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round, pathEffect = dashEffect))
+                }
             }
             is CadPoint -> {
                 val sp = viewport.worldToScreen(entity.position)
@@ -392,8 +583,17 @@ object CadCanvasRenderer {
                 drawLine(color, viewport.worldToScreen(entity.origin - dir), viewport.worldToScreen(entity.origin + dir), strokeWidth = strokePx, pathEffect = dashEffect)
             }
             is CadText -> {
+                val rawFontPx = (entity.height * zoom).toFloat()
+                if (rawFontPx < 3.5f && !entity.isSelected) {
+                    if (rawFontPx >= 1.2f) {
+                        val sp = viewport.worldToScreen(entity.position)
+                        val approxW = (entity.text.length * rawFontPx * 0.55f).coerceAtLeast(3f)
+                        drawLine(color.copy(alpha = 0.7f), sp, Offset(sp.x + approxW, sp.y), strokeWidth = 1.4f)
+                    }
+                    return
+                }
                 val sp = viewport.worldToScreen(entity.position)
-                val fontSizePx = (entity.height * viewport.zoom).toFloat().coerceIn(10f, 96f)
+                val fontSizePx = rawFontPx.coerceIn(10f, 96f)
                 drawIntoCanvas { canvas ->
                     nativeTextPaint.color = entity.colorArgb ?: layer?.colorArgb ?: if (isDarkCanvas) 0xFFECF2F8.toInt() else 0xFF101923.toInt()
                     if (!isDarkCanvas && (nativeTextPaint.color and 0xFFFFFF) == 0xFFFFFF) {
@@ -408,34 +608,18 @@ object CadCanvasRenderer {
                 }
             }
             is CadBlockReference -> {
-                val def = doc.blocks[entity.blockName] ?: return
-                for (sub in GeometryEngine.explodeBlockReference(entity, def)) {
-                    drawCadEntity(sub.copyCommon(isSelected = entity.isSelected), doc, layer, viewport, isDarkCanvas, isPreview)
+                val children = spatialIndex?.explodedBlockEntities(entity.id)
+                    ?: doc.blocks[entity.blockName]?.let { GeometryEngine.explodeBlockReference(entity, it) }
+                    ?: return
+                for (sub in children) {
+                    val target = if (entity.isSelected) sub.copyCommon(isSelected = true) else sub
+                    drawCadEntity(target, doc, layer, viewport, isDarkCanvas, isPreview, spatialIndex, screenExtentPx, suppressDashing)
                 }
             }
             is CadDimension -> {
                 drawDimensionEntity(entity, doc, viewport, isDarkCanvas, strokePx)
             }
         }
-    }
-
-    private fun DrawScope.drawPointSequence(
-        pts: List<Vec2>,
-        viewport: ViewportState,
-        color: Color,
-        stroke: Stroke,
-        closed: Boolean
-    ) {
-        if (pts.size < 2) return
-        val path = Path()
-        val p0 = viewport.worldToScreen(pts[0])
-        path.moveTo(p0.x, p0.y)
-        for (i in 1 until pts.size) {
-            val pi = viewport.worldToScreen(pts[i])
-            path.lineTo(pi.x, pi.y)
-        }
-        if (closed) path.close()
-        drawPath(path, color, style = stroke)
     }
 
     private fun DrawScope.drawDimensionEntity(
@@ -540,13 +724,12 @@ object CadCanvasRenderer {
         val base = Offset(tip.x - ux * size, tip.y - uy * size)
         val p1 = Offset(base.x - uy * wing, base.y + ux * wing)
         val p2 = Offset(base.x + uy * wing, base.y - ux * wing)
-        val path = Path().apply {
-            moveTo(tip.x, tip.y)
-            lineTo(p1.x, p1.y)
-            lineTo(p2.x, p2.y)
-            close()
-        }
-        drawPath(path, color)
+        scratchPath.reset()
+        scratchPath.moveTo(tip.x, tip.y)
+        scratchPath.lineTo(p1.x, p1.y)
+        scratchPath.lineTo(p2.x, p2.y)
+        scratchPath.close()
+        drawPath(scratchPath, color)
     }
 
     private fun DrawScope.drawOsnapMarker(center: Offset, type: OsnapType) {
@@ -556,24 +739,22 @@ object CadCanvasRenderer {
         when (type) {
             OsnapType.ENDPOINT -> drawRect(c, Offset(center.x - s, center.y - s), Size(s * 2, s * 2), style = stroke)
             OsnapType.MIDPOINT -> {
-                val p = Path().apply {
-                    moveTo(center.x, center.y - s - 2f)
-                    lineTo(center.x - s, center.y + s)
-                    lineTo(center.x + s, center.y + s)
-                    close()
-                }
-                drawPath(p, c, style = stroke)
+                scratchPath.reset()
+                scratchPath.moveTo(center.x, center.y - s - 2f)
+                scratchPath.lineTo(center.x - s, center.y + s)
+                scratchPath.lineTo(center.x + s, center.y + s)
+                scratchPath.close()
+                drawPath(scratchPath, c, style = stroke)
             }
             OsnapType.CENTER -> drawCircle(c, radius = s, center = center, style = stroke)
             OsnapType.QUADRANT -> {
-                val p = Path().apply {
-                    moveTo(center.x, center.y - s - 2f)
-                    lineTo(center.x + s + 2f, center.y)
-                    lineTo(center.x, center.y + s + 2f)
-                    lineTo(center.x - s - 2f, center.y)
-                    close()
-                }
-                drawPath(p, c, style = stroke)
+                scratchPath.reset()
+                scratchPath.moveTo(center.x, center.y - s - 2f)
+                scratchPath.lineTo(center.x + s + 2f, center.y)
+                scratchPath.lineTo(center.x, center.y + s + 2f)
+                scratchPath.lineTo(center.x - s - 2f, center.y)
+                scratchPath.close()
+                drawPath(scratchPath, c, style = stroke)
             }
             OsnapType.INTERSECTION -> {
                 drawLine(c, Offset(center.x - s, center.y - s), Offset(center.x + s, center.y + s), strokeWidth = 2.4f)
@@ -608,13 +789,13 @@ object CadCanvasRenderer {
             val width = nativeTextPaint.measureText(text)
             val padH = 12f
             val padV = 8f
-            val rectPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = bgColor }
+            badgeBgPaint.color = bgColor
             canvas.nativeCanvas.drawRoundRect(
                 screenPos.x - padH,
                 screenPos.y - 26f - padV,
                 screenPos.x + width + padH,
                 screenPos.y + padV,
-                10f, 10f, rectPaint
+                10f, 10f, badgeBgPaint
             )
             nativeTextPaint.color = textColor
             canvas.nativeCanvas.drawText(text, screenPos.x, screenPos.y - 2f, nativeTextPaint)
